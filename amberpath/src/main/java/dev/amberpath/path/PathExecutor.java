@@ -13,9 +13,14 @@ import net.minecraft.world.phys.Vec3;
 
 /**
  * Suit le chemin en simulant les entrées clavier vanilla. Robuste à TRES haute vitesse
- * (tolérances et sauts prédictifs proportionnels à la vélocité live), aux chutes
- * (contrôle en l'air, anti-dépassement, garde santé avant chute risquée) et au recul :
- * « saute » les nœuds déjà dépassés au lieu de perdre le chemin. Ignore les mobs.
+ * (tolérances et sauts prédictifs proportionnels à la vélocité live, « pure pursuit »
+ * qui vise le nœud suivant dans les virages pour ne pas casser l'élan), aux chutes
+ * (contrôle en l'air, anti-dépassement, garde santé avant chute risquée, récupération
+ * immédiate du chemin après atterrissage) et au recul : « saute » les nœuds déjà
+ * dépassés au lieu de perdre le chemin. Ignore les mobs.
+ *
+ * Skyblock : course sur l'eau (sprint forcé, jamais de sneak, coup de saut si on
+ * s'enfonce), auto-step assisté d'un saut client si le serveur tarde à monter.
  */
 public class PathExecutor {
 	public enum Signal { NONE, PATH_END, STUCK, BLOCKED, FALL_UNSAFE }
@@ -35,6 +40,9 @@ public class PathExecutor {
 	}
 
 	public BlockPos target() { return idx < path.nodes.size() ? path.nodes.get(idx) : null; }
+	public boolean currentWaterRun() {
+		return idx - 1 >= 0 && idx - 1 < path.moves.size() && path.moves.get(idx - 1).waterRun;
+	}
 
 	public void release() {
 		var o = mc.options;
@@ -56,11 +64,11 @@ public class PathExecutor {
 		while (j < limit) {
 			BlockPos n = path.nodes.get(j);
 			int k = model.kind(n.getX(), n.getY(), n.getZ());
-			double tf = k == WorldModel.GROUND ? model.floorOf(k, n.getX(), n.getY(), n.getZ()) : n.getY();
+			double tf = k == WorldModel.GROUND || k == WorldModel.SURFACE ? model.floorOf(k, n.getX(), n.getY(), n.getZ()) : n.getY();
 			if (Double.isNaN(tf)) tf = n.getY();
 			double dx = n.getX() + 0.5 - f.x, dz = n.getZ() + 0.5 - f.z;
 			double d2 = Math.hypot(dx, dz);
-			boolean near = (k == WorldModel.GROUND)
+			boolean near = (k == WorldModel.GROUND || k == WorldModel.SURFACE)
 					? d2 < reach && Math.abs(f.y - tf) < vertTol
 					: Math.sqrt(d2 * d2 + (tf - f.y) * (tf - f.y)) < Math.max(0.65, v * 0.9);
 			if (near) { j++; continue; }
@@ -79,6 +87,20 @@ public class PathExecutor {
 			break;
 		}
 		if (j > idx) { idx = j; stuckTicks = 0; bestDist = Double.MAX_VALUE; }
+	}
+
+	/** Après une chute : retrouve le premier nœud du chemin proche de la position réelle. */
+	private int recoverAfterFall(Vec3 feet) {
+		int limit = Math.min(path.nodes.size(), idx + 64);
+		for (int j = idx; j < limit; j++) {
+			BlockPos n = path.nodes.get(j);
+			int k = model.kind(n.getX(), n.getY(), n.getZ());
+			double tf = k == WorldModel.GROUND || k == WorldModel.SURFACE ? model.floorOf(k, n.getX(), n.getY(), n.getZ()) : n.getY();
+			if (Double.isNaN(tf)) tf = n.getY();
+			double d = Math.hypot(n.getX() + 0.5 - feet.x, n.getZ() + 0.5 - feet.z);
+			if (d < 2.3 && Math.abs(feet.y - tf) < 2.8) return j;
+		}
+		return -1;
 	}
 
 	public Signal tick() {
@@ -114,10 +136,29 @@ public class PathExecutor {
 		double dy = tf - feet.y;
 		double dist3 = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
-		boolean advanced = (tk == WorldModel.GROUND)
+		boolean advanced = (tk == WorldModel.GROUND || tk == WorldModel.SURFACE)
 				? dist2 < Math.max(0.42, v * 0.85) && Math.abs(feet.y - tf) < Math.max(0.75, v * 0.5 + 0.3)
 				: dist3 < Math.max(0.65, v * 0.85);
 		if (advanced) { idx++; stuckTicks = 0; bestDist = Double.MAX_VALUE; return Signal.NONE; }
+
+		boolean onGround = p.onGround();
+		boolean inWater = p.isInWater();
+
+		// --- Garde anti-void / récupération de chute ---
+		if (!onGround && p.getDeltaMovement().y < -0.02) {
+			if (feet.y < mc.level.getMinY() + 1) { release(); return Signal.STUCK; }
+			if (feet.y < tf - 3.0) {
+				int rec = recoverAfterFall(feet);
+				if (rec > 0) { idx = rec; stuckTicks = 0; bestDist = Double.MAX_VALUE; release(); return Signal.NONE; }
+				if (feet.y < tf - 6.0) { release(); return Signal.STUCK; } // replanification immédiate
+			}
+		}
+		if (wasAirborne && onGround) {
+			int rec = recoverAfterFall(feet);
+			if (rec > idx) idx = rec;
+			stuckTicks = 0; bestDist = Double.MAX_VALUE;
+		}
+		wasAirborne = !onGround;
 
 		// Porte / portillon à ouvrir
 		if (mv.door && model.doorClosed(t.getX(), t.getY(), t.getZ())) {
@@ -133,8 +174,25 @@ public class PathExecutor {
 			}
 		}
 
-		// Orientation (pas de rotation proportionnel à la vitesse)
-		float desiredYaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+		// Orientation — « pure pursuit » : vise entre le nœud courant et le suivant dans les virages.
+		double aimX = tx, aimZ = tz;
+		if (mv.type == PathEngine.WALK && !mv.door && !mv.waterRun && idx + 1 < path.nodes.size()) {
+			PathEngine.Move mv2 = path.moves.get(idx);
+			if (mv2.type == PathEngine.WALK && !mv2.door) {
+				BlockPos n2 = path.nodes.get(idx + 1);
+				double nx2 = n2.getX() + 0.5, nz2 = n2.getZ() + 0.5;
+				double d2x = nx2 - feet.x, d2z = nz2 - feet.z;
+				double l2 = Math.hypot(d2x, d2z);
+				if (dist2 > 1e-3 && l2 > 1e-3) {
+					double dot = (dx * d2x + dz * d2z) / (dist2 * l2);
+					if (dot > 0.55 && dist2 < Math.max(1.6, v * 2.6)) {
+						aimX = tx + (nx2 - tx) * 0.45;
+						aimZ = tz + (nz2 - tz) * 0.45;
+					}
+				}
+			}
+		}
+		float desiredYaw = (float) Math.toDegrees(Math.atan2(-(aimX - feet.x), aimZ - feet.z));
 		boolean verticalAim = tk == WorldModel.WATER || tk == WorldModel.LAVA || tk == WorldModel.CLIMB || tk == WorldModel.FLY || mv.type == PathEngine.CLIMB_UP;
 		float desiredPitch = verticalAim
 				? Mth.clamp((float) -Math.toDegrees(Math.atan2(dy + (tk == WorldModel.CLIMB ? 0.4 : 0), Math.max(0.3, dist2))), -80, 80)
@@ -144,10 +202,14 @@ public class PathExecutor {
 		boolean aligned = err < (mv.type == PathEngine.PARKOUR ? 14 : 38);
 
 		boolean forward = aligned, jump = false, sneak = false, sprint = false;
-		boolean inWater = p.isInWater();
-		boolean onGround = p.onGround();
 
-		switch (mv.type) {
+		if (mv.waterRun) {
+			// Course sur l'eau : sprint permanent, aucun sneak, saut seulement si on s'enfonce.
+			sprint = aligned;
+			forward = aligned || (v > 0.2 && err < 75); // garde l'élan pendant le réalignement
+			jump = p.isUnderWater() || feet.y < tf - 0.30;
+			if (inWater && v < 0.12) jump = true; // remonter à la surface avant d'accélérer
+		} else switch (mv.type) {
 			case PathEngine.PARKOUR -> {
 				sprint = aligned && cfg.sprint;
 				forward = aligned;
@@ -194,24 +256,22 @@ public class PathExecutor {
 				if (dy < -0.3) sneak = true;
 				sprint = cfg.sprint && dist3 > 3;
 			}
-			default -> { // WALK
+			default -> { // WALK (auto-step Skyblock assisté d'un saut client si besoin)
 				forward = aligned;
 				sprint = aligned && cfg.sprint && mv.sprint && dist2 > 1.6;
-				if (dy > 0.55 && onGround && aligned && dist2 < 1.2 + v) jump = true; // marche non auto-step
+				if (dy > 0.55 && onGround && aligned && dist2 < 1.2 + v) jump = true;
 			}
 		}
 
-		// Sécurité magma : accroupi (Swift Sneak accélère)
-		if (cfg.sneakMagma && (model.magma(p.getBlockX(), p.getBlockY() - 1, p.getBlockZ())
+		// Sécurité magma : accroupi (Swift Sneak accélère) — inutile si Résistance au feu / Frost Walker.
+		if (cfg.sneakMagma && !model.magmaSafe() && (model.magma(p.getBlockX(), p.getBlockY() - 1, p.getBlockZ())
 				|| model.magma(t.getX(), t.getY() - 1, t.getZ()))) { sneak = true; sprint = false; }
-		if (inWater && mv.type != PathEngine.SWIM && tk == WorldModel.GROUND) jump = jump || aligned;
+		if (inWater && !mv.waterRun && mv.type != PathEngine.SWIM && tk == WorldModel.GROUND) jump = jump || aligned;
 
 		setKeys(forward, jump, sneak, sprint);
 
-		// Anti-blocage (réinitialisé à l'atterrissage pour ne pas perdre le chemin après une chute)
-		if (wasAirborne && onGround) { stuckTicks = 0; bestDist = Double.MAX_VALUE; }
-		wasAirborne = !onGround;
-		double d = tk == WorldModel.GROUND ? dist2 : dist3;
+		// Anti-blocage
+		double d = tk == WorldModel.GROUND || tk == WorldModel.SURFACE ? dist2 : dist3;
 		if (d < bestDist - 0.04) { bestDist = d; stuckTicks = 0; } else stuckTicks++;
 		if (p.horizontalCollision && forward) collisionTicks++; else collisionTicks = 0;
 		stuckByCollision = collisionTicks > 20;

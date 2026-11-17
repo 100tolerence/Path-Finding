@@ -6,6 +6,8 @@ import net.minecraft.client.Minecraft;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 /** Tous les paramètres de navigation, persistés dans config/amberpath.json. */
 public class AmberConfig {
@@ -33,6 +35,7 @@ public class AmberConfig {
 	public int budgetMs = 5;          // temps de calcul par tick
 	public boolean autoReplan = true;
 	public int nearRadius = 3;
+	public boolean smoothPath = true; // lissage « string-pulling » des longs segments
 
 	// Confort / sécurité
 	public boolean pauseInMenus = true;
@@ -41,11 +44,36 @@ public class AmberConfig {
 	public boolean showPath = true;
 	public boolean smoothRotation = true;
 
+	// --- Hypixel Skyblock ---
+	public boolean skyblockAuto = true;   // détection automatique de Hypixel Skyblock
+	public boolean sbUseTabSpeed = true;  // lire la stat ✦ Speed dans la liste des joueurs (tab)
+	public boolean sbAutoStep = true;     // montée automatique des blocs entiers à haute vitesse
+	public int sbStepSpeed = 300;         // seuil ✦ Speed pour l'auto-step
+	public boolean sbForceStep = false;   // forcer l'auto-step quel que soit la vitesse
+	public boolean sbWaterWalk = true;    // courir SUR l'eau à très haute vitesse
+	public int sbWaterSpeed = 400;        // seuil ✦ Speed pour la marche sur l'eau
+	public boolean sbForceWater = false;  // forcer la marche sur l'eau quel que soit la vitesse
+	public boolean frostWalkerWalk = true;// Semelles givrantes : l'eau gèle sous les pas
+	public boolean voidGuard = true;      // aucune chute / aucun saut sans atterrissage confirmé
+	public int maxFallScan = 96;          // profondeur max de recherche d'atterrissage (blocs)
+
 	// Objectif
 	public int goalMode = 0;          // 0 = se tenir dessus, 1 = atteindre, 2 = approcher
 	public String lastX = "";
 	public String lastY = "";
 	public String lastZ = "";
+
+	// Points de repère enregistrés (îles, hub, jardin…))
+	public List<Preset> presets = new ArrayList<>();
+
+	public static class Preset {
+		public String name;
+		public int x;
+		public Integer y;
+		public int z;
+		public Preset() {}
+		public Preset(String name, int x, Integer y, int z) { this.name = name; this.x = x; this.y = y; this.z = z; }
+	}
 
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 	private static Path file() {
@@ -57,7 +85,10 @@ public class AmberConfig {
 			Path p = file();
 			if (Files.exists(p)) {
 				AmberConfig c = GSON.fromJson(Files.readString(p), AmberConfig.class);
-				if (c != null) return c;
+				if (c != null) {
+					if (c.presets == null) c.presets = new ArrayList<>();
+					return c;
+				}
 			}
 		} catch (Exception ignored) {}
 		return new AmberConfig();

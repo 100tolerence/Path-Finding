@@ -1,8 +1,8 @@
 package dev.amberpath.path;
 
-import dev.amberpath.AmberPathClient;
 import dev.amberpath.config.AmberConfig;
 import dev.amberpath.gui.AmberPathScreen;
+import dev.amberpath.skyblock.SkyblockHelper;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
@@ -15,7 +15,7 @@ import net.minecraft.world.phys.Vec3;
 import java.util.HashMap;
 import java.util.Map;
 
-/** Orchestrateur : machine à états, recherche, exécution, replanification, gizmos. */
+/** Orchestrateur : machine à états, recherche, exécution, replanification, gizmos, Skyblock. */
 public class Navigator {
 	public enum Status { IDLE, COMPUTING, RUNNING, PAUSED, ARRIVED, FAILED }
 
@@ -25,11 +25,13 @@ public class Navigator {
 	public PathEngine.Goal goal;
 	public String pauseReason = "";
 	public long arrivedAt = 0;
+	public long failedAt = 0;
 	public int lastExpansions = 0;
 	public long lastComputeMs = 0;
 	public double lastPathLen = 0;
 	public double lastSpeedFactor = 1;
 	public int lastMaxGap = 3;
+	public int lastSmoothed = 0;
 
 	private PathEngine engine;
 	private PathExecutor executor;
@@ -40,12 +42,15 @@ public class Navigator {
 	private int damageWindow = 0;
 	private int replans = 0;
 	private int refreshTimer = 0;
+	private int sbTimer = 0;
 	private long retryAt = 0;
+	private boolean manualPause = false;
 
 	public Navigator(AmberConfig cfg) { this.cfg = cfg; }
 
 	public boolean active() { return status == Status.COMPUTING || status == Status.RUNNING || status == Status.PAUSED; }
 	public PlayerPhysics physics() { return model != null ? model.phys : null; }
+	public boolean onWaterRun() { return executor != null && executor.currentWaterRun(); }
 
 	public void msg(String text) {
 		if (mc.player != null) mc.player.sendSystemMessage(Component.literal("§6[AmberPath] §r" + text));
@@ -56,9 +61,10 @@ public class Navigator {
 		this.goal = g;
 		this.replans = 0;
 		this.retryAt = 0;
+		this.manualPause = false;
 		this.lastHealth = mc.player.getHealth();
-		beginSearch();
-		status = Status.COMPUTING;
+		this.engine = null;
+		this.status = Status.COMPUTING;
 		mc.player.playSound(SoundEvents.EXPERIENCE_ORB_PICKUP, 0.7f, 1.4f);
 		msg("Navigation vers §e" + g.x + ", " + (g.y == null ? "auto" : g.y) + ", " + g.z + "§r…");
 	}
@@ -67,6 +73,7 @@ public class Navigator {
 		if (executor != null) executor.release();
 		status = Status.IDLE;
 		engine = null; executor = null; path = null;
+		manualPause = false;
 	}
 
 	public void toggle() {
@@ -77,22 +84,41 @@ public class Navigator {
 		else { mc.setScreenAndShow(new AmberPathScreen()); msg("Définissez d'abord une destination (§eG§r par défaut)."); }
 	}
 
+	/** Pause / reprise manuelle (touche dédiée). */
+	public void togglePause() {
+		if (status == Status.RUNNING || status == Status.COMPUTING) {
+			manualPause = true;
+			status = Status.PAUSED;
+			pauseReason = "pause manuelle";
+			if (executor != null) executor.release();
+			msg("Navigation §een pause§r.");
+		} else if (status == Status.PAUSED && manualPause) {
+			manualPause = false;
+			status = executor != null ? Status.RUNNING : Status.COMPUTING;
+			msg("Navigation §areprise§r.");
+		}
+	}
+
 	private BlockPos findStart() {
 		LocalPlayer p = mc.player;
 		int x = Mth_floor(p.getX()), z = Mth_floor(p.getZ());
 		int y0 = Mth_floor(p.getY());
-		for (int y = y0 + 1; y >= y0 - 2; y--) {
+		for (int y = y0 + 2; y >= y0 - 3; y--) {
 			if (model.kind(x, y, z) != WorldModel.INVALID) return new BlockPos(x, y, z);
 		}
-		return new BlockPos(x, y0, z);
+		if (p.onGround() || p.isInWater()) return new BlockPos(x, y0, z);
+		return null; // en l'air au-dessus du vide : on attend d'atterrir
 	}
 	private static int Mth_floor(double v) { return (int) Math.floor(v); }
 
-	private void beginSearch() {
+	private boolean beginSearch() {
 		model = new WorldModel(mc.level, mc.player, cfg, tempBlocked.keySet());
-		lastSpeedFactor = model.phys.speedFactor;
+		lastSpeedFactor = model.phys.effSpeed;
 		lastMaxGap = cfg.adaptiveParkour ? Math.max(cfg.maxGap, model.phys.maxGapFlat) : cfg.maxGap;
-		engine = new PathEngine(model, cfg, findStart(), goal);
+		BlockPos s = findStart();
+		if (s == null) { engine = null; return false; }
+		engine = new PathEngine(model, cfg, s, goal);
+		return true;
 	}
 
 	private boolean goalReached() {
@@ -101,7 +127,8 @@ public class Navigator {
 		Vec3 f = p.position();
 		switch (goal.mode) {
 			case 0:
-				return Mth_floor(f.x) == goal.x && Mth_floor(f.z) == goal.z && p.onGround()
+				double dx0 = f.x - (goal.x + 0.5), dz0 = f.z - (goal.z + 0.5);
+				return dx0 * dx0 + dz0 * dz0 < 0.5625 && (p.onGround() || p.isInWater())
 						&& (goal.y == null || Math.abs(f.y - (goal.y + 1)) < 0.8);
 			case 1:
 				return Mth_floor(f.x) == goal.x && Mth_floor(f.z) == goal.z
@@ -116,10 +143,12 @@ public class Navigator {
 	public void tickStart() {
 		long now = System.currentTimeMillis();
 		tempBlocked.entrySet().removeIf(e -> e.getValue() < now);
+		if (cfg.skyblockAuto && ++sbTimer >= 20) { sbTimer = 0; SkyblockHelper.refresh(mc, cfg); }
+
 		if (status == Status.IDLE || status == Status.ARRIVED || status == Status.FAILED) {
 			// Réessai auto si l'objectif était hors chunks chargés
 			if (status == Status.FAILED && retryAt > 0 && now >= retryAt && mc.player != null && mc.level != null) {
-				retryAt = 0; beginSearch(); status = Status.COMPUTING;
+				retryAt = 0; engine = null; status = Status.COMPUTING;
 			}
 			return;
 		}
@@ -127,7 +156,7 @@ public class Navigator {
 		if (p == null || mc.level == null) { stop(); return; }
 		if (p.isDeadOrDying()) { stop(); msg("§cJoueur mort — navigation arrêtée.§r"); return; }
 
-		// Pause auto (menus, véhicule, lévitation, élytre, sommeil, dégâts si activé)
+		// Pause auto (menus, véhicule, lévitation, élytre, sommeil, dégâts si activé) + pause manuelle
 		boolean menuPause = cfg.pauseInMenus && mc.gui.screen() != null && !(mc.gui.screen() instanceof AmberPathScreen);
 		boolean vehiclePause = p.getVehicle() != null;
 		boolean levPause = p.hasEffect(net.minecraft.world.effect.MobEffects.LEVITATION);
@@ -139,10 +168,10 @@ public class Navigator {
 			if (damageWindow > 0) damageWindow--;
 		}
 		boolean damagePause = cfg.pauseOnDamage && damageWindow > 0 && p.getHealth() < p.getMaxHealth() - 1;
-		if (menuPause || vehiclePause || levPause || elytraPause || sleepPause || damagePause) {
+		if (manualPause || menuPause || vehiclePause || levPause || elytraPause || sleepPause || damagePause) {
 			if (status != Status.PAUSED) {
 				status = Status.PAUSED;
-				pauseReason = menuPause ? "menu ouvert" : vehiclePause ? "véhicule" : levPause ? "lévitation"
+				pauseReason = manualPause ? "pause manuelle" : menuPause ? "menu ouvert" : vehiclePause ? "véhicule" : levPause ? "lévitation"
 						: elytraPause ? "élytre" : sleepPause ? "sommeil" : "dégâts récents";
 				if (executor != null) executor.release();
 			}
@@ -154,6 +183,7 @@ public class Navigator {
 		if (goalReached()) { arrive(); return; }
 
 		if (status == Status.COMPUTING) {
+			if (engine == null && !beginSearch()) return; // attend un point de départ valide
 			engine.tick();
 			if (engine.state == PathEngine.State.SEARCHING) return;
 			lastExpansions = engine.expansions;
@@ -161,10 +191,10 @@ public class Navigator {
 			if (engine.state == PathEngine.State.FAILED || engine.result() == null || engine.result().nodes.size() < 2) {
 				boolean goalLoaded = model.loaded(goal.x, goal.y == null ? Mth_floor(p.getY()) : goal.y, goal.z);
 				if (!goalLoaded && cfg.autoReplan) {
-					status = Status.FAILED; retryAt = now + 1500;
+					status = Status.FAILED; failedAt = now; retryAt = now + 1500;
 					msg("Objectif hors chunks chargés — §enouvelle tentative automatique§r…");
 				} else {
-					status = Status.FAILED;
+					status = Status.FAILED; failedAt = now;
 					msg("§cAucun chemin trouvé§r (objectif inaccessible ou hors chunks chargés).");
 					p.playSound(SoundEvents.VILLAGER_NO, 0.6f, 1f);
 				}
@@ -172,6 +202,7 @@ public class Navigator {
 			}
 			path = engine.result();
 			lastPathLen = path.cost;
+			lastSmoothed = path.smoothed;
 			executor = new PathExecutor(mc, cfg, model, path);
 			status = Status.RUNNING;
 			if (path.partial) msg("Chemin partiel calculé (§e" + path.nodes.size() + "§r nœuds) — progression vers la frontière chargée…");
@@ -179,31 +210,33 @@ public class Navigator {
 		}
 
 		if (status == Status.RUNNING && executor != null) {
-			// Rafraîchit le profil physique live (effets qui expirent, santé, enchantements)
+			// Rafraîchit le profil physique live (effets qui expirent, santé, enchantements, ✦ Speed)
 			if (++refreshTimer >= 40) { refreshTimer = 0; model.refresh(p); }
 			PathExecutor.Signal sig = executor.tick();
 			switch (sig) {
 				case PATH_END -> {
 					if (goalReached()) arrive();
-					else if (cfg.autoReplan && replans < 64) { replans++; beginSearch(); status = Status.COMPUTING; }
-					else { status = Status.FAILED; msg("§cImpossible d'atteindre l'objectif.§r"); }
+					else if (cfg.autoReplan && replans < 64) { replans++; engine = null; beginSearch(); status = Status.COMPUTING; }
+					else { status = Status.FAILED; failedAt = now; msg("§cImpossible d'atteindre l'objectif.§r"); }
 				}
 				case FALL_UNSAFE -> {
-					if (!cfg.autoReplan || replans >= 64) { status = Status.FAILED; msg("§cChute trop dangereuse — arrêt.§r"); executor.release(); return; }
+					if (!cfg.autoReplan || replans >= 64) { status = Status.FAILED; failedAt = now; msg("§cChute trop dangereuse — arrêt.§r"); executor.release(); return; }
 					replans++;
 					BlockPos t = executor.target();
-					if (t != null) tempBlocked.put(t.asLong(), now + 12000);
+					if (t != null) { tempBlocked.put(t.asLong(), now + 12000); if (model != null) model.invalidate(); }
 					msg("Chute évitée (santé insuffisante) — §erecalcul§r…");
-					beginSearch(); status = Status.COMPUTING;
+					engine = null; beginSearch(); status = Status.COMPUTING;
 				}
 				case STUCK, BLOCKED -> {
-					if (!cfg.autoReplan || replans >= 64) { status = Status.FAILED; msg("§cBlocage — navigation arrêtée.§r"); executor.release(); return; }
+					if (!cfg.autoReplan || replans >= 64) { status = Status.FAILED; failedAt = now; msg("§cBlocage — navigation arrêtée.§r"); executor.release(); return; }
 					replans++;
 					BlockPos t = executor.target();
 					// Ne bloque le nœud que si c'est un vrai mur (pas un simple dépassement après chute).
-					if (t != null && (sig == PathExecutor.Signal.BLOCKED || executor.stuckByCollision))
+					if (t != null && (sig == PathExecutor.Signal.BLOCKED || executor.stuckByCollision)) {
 						tempBlocked.put(t.asLong(), now + 15000);
-					beginSearch(); status = Status.COMPUTING;
+						if (model != null) model.invalidate();
+					}
+					engine = null; beginSearch(); status = Status.COMPUTING;
 				}
 				default -> {}
 			}
@@ -231,7 +264,8 @@ public class Navigator {
 			for (int i = executor.idx; i < path.nodes.size(); i++) {
 				BlockPos n = path.nodes.get(i);
 				Vec3 cur = Vec3.atCenterOf(n).add(0, -0.4, 0);
-				Gizmos.line(prev, cur, 0xCCE8A85C, 2.0f).persistForMillis(120);
+				boolean water = i - 1 >= 0 && i - 1 < path.moves.size() && path.moves.get(i - 1).waterRun;
+				Gizmos.line(prev, cur, water ? 0xCC7FD4E8 : 0xCCE8A85C, 2.0f).persistForMillis(120);
 				prev = cur;
 			}
 			if (goal != null) {
