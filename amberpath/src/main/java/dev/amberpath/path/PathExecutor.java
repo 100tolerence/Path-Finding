@@ -31,6 +31,7 @@ public class PathExecutor {
 	private final PathEngine.PathResult path;
 	public int idx = 1;
 	public boolean stuckByCollision = false;
+	public final AimController aim = new AimController();
 	private int stuckTicks = 0, collisionTicks = 0, doorCooldown = 0, validateTimer = 0;
 	private double bestDist = Double.MAX_VALUE;
 	private boolean wasAirborne = false;
@@ -45,6 +46,7 @@ public class PathExecutor {
 	}
 
 	public void release() {
+		aim.clear();
 		var o = mc.options;
 		o.keyUp.setDown(false); o.keyDown.setDown(false); o.keyLeft.setDown(false);
 		o.keyRight.setDown(false); o.keyJump.setDown(false); o.keyShift.setDown(false); o.keySprint.setDown(false);
@@ -199,7 +201,7 @@ public class PathExecutor {
 				: (mv.type == PathEngine.CLIMB_DOWN ? 70f : p.getXRot());
 		aim(p, desiredYaw, desiredPitch, cfg.smoothRotation, v);
 		float err = Math.abs(Mth.wrapDegrees(desiredYaw - p.getYRot()));
-		boolean aligned = err < (mv.type == PathEngine.PARKOUR ? 14 : 38);
+		boolean aligned = err < (mv.type == PathEngine.PARKOUR ? 16 : 50);
 
 		boolean forward = aligned, jump = false, sneak = false, sprint = false;
 
@@ -286,11 +288,9 @@ public class PathExecutor {
 	}
 
 	private void aim(LocalPlayer p, float yaw, float pitch, boolean smooth, double v) {
-		float step = smooth ? Mth.clamp(32f + (float) v * 45f, 32f, 180f) : 180f;
-		float ny = p.getYRot() + Mth.clamp(Mth.wrapDegrees(yaw - p.getYRot()), -step, step);
-		float np = p.getXRot() + Mth.clamp(pitch - p.getXRot(), -step, step);
-		p.setYRot(ny); p.setXRot(Mth.clamp(np, -89, 89));
-		p.setYHeadRot(ny); p.yBodyRot = ny;
+		// Rotation lissee a chaque IMAGE (voir AimController / AmberHud), pas seulement a chaque tick.
+		aim.setTarget(yaw, pitch, smooth, v, cfg.turnSpeed);
+		aim.tickFallback(p);
 	}
 
 	private void setKeys(boolean forward, boolean jump, boolean sneak, boolean sprint) {

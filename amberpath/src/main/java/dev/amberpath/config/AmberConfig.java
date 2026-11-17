@@ -30,9 +30,12 @@ public class AmberConfig {
 	public boolean flyAuto = true;    // mode vol créatif automatique
 
 	// Recherche
-	public double weight = 1.15;      // 1.0 = optimal, 1.6 = rapide
+	public double weight = 1.6;       // 1.0 = optimal, 2.0+ = tres rapide
 	public int maxNodes = 160000;
-	public int budgetMs = 5;          // temps de calcul par tick
+	public int budgetMs = 12;         // temps de calcul par tick
+	public int partialAfterMs = 500;  // apres ce delai, on demarre sur un chemin partiel (0 = desactive)
+	public double turnSpeed = 1.0;    // vitesse de rotation de la camera (1 = defaut)
+	public int cfgVersion = 0;
 	public boolean autoReplan = true;
 	public int nearRadius = 3;
 	public boolean smoothPath = true; // lissage « string-pulling » des longs segments
@@ -55,7 +58,7 @@ public class AmberConfig {
 	public boolean sbForceWater = false;  // forcer la marche sur l'eau quel que soit la vitesse
 	public boolean frostWalkerWalk = true;// Semelles givrantes : l'eau gèle sous les pas
 	public boolean voidGuard = true;      // aucune chute / aucun saut sans atterrissage confirmé
-	public int maxFallScan = 96;          // profondeur max de recherche d'atterrissage (blocs)
+	public int maxFallScan = 48;          // profondeur max de recherche d'atterrissage (blocs)
 
 	// Objectif
 	public int goalMode = 0;          // 0 = se tenir dessus, 1 = atteindre, 2 = approcher
@@ -87,6 +90,13 @@ public class AmberConfig {
 				AmberConfig c = GSON.fromJson(Files.readString(p), AmberConfig.class);
 				if (c != null) {
 					if (c.presets == null) c.presets = new ArrayList<>();
+					if (c.cfgVersion < 1) { // migration : nouveaux defauts de performance
+						if (c.weight < 1.5) c.weight = 1.6;
+						if (c.budgetMs < 12) c.budgetMs = 12;
+						if (c.maxFallScan > 48) c.maxFallScan = 48;
+						c.cfgVersion = 1;
+						c.save();
+					}
 					return c;
 				}
 			}

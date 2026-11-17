@@ -211,8 +211,8 @@ public class AmberPathScreen extends Screen {
 		try {
 			super.extractBackground(ex, mx, my, delta);
 		} catch (IllegalStateException alreadyBlurred) {
-			// Un flou a déjà été demandé dans cette frame (ex. rendu immédiat de setScreenAndShow) : on l'ignore.
-			ex.fill(0, 0, width, height, 0x66000000);
+			// Un flou a déjà été demandé dans cette frame : on applique un voile ambré léger à la place.
+			ex.fill(0, 0, width, height, 0x4D120802);
 		}
 	}
 

@@ -16,6 +16,7 @@ public class AmberHud implements HudElement {
 	public void extractRenderState(GuiGraphicsExtractor ex, DeltaTracker dt) {
 		var cfg = AmberPathClient.CONFIG;
 		Navigator nav = AmberPathClient.NAV;
+		if (nav != null) nav.frameAim();
 		if (!cfg.showHud || nav == null) return;
 		boolean show = nav.active() || (nav.status == Navigator.Status.ARRIVED && System.currentTimeMillis() - nav.arrivedAt < 4000)
 				|| nav.status == Navigator.Status.FAILED;

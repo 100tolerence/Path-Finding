@@ -50,6 +50,8 @@ public class Navigator {
 
 	public boolean active() { return status == Status.COMPUTING || status == Status.RUNNING || status == Status.PAUSED; }
 	public PlayerPhysics physics() { return model != null ? model.phys : null; }
+	/** Appele a chaque image (HUD) : rotation camera fluide entre deux ticks. */
+	public void frameAim() { if (status == Status.RUNNING && executor != null) executor.aim.frame(mc.player); }
 	public boolean onWaterRun() { return executor != null && executor.currentWaterRun(); }
 
 	public void msg(String text) {
@@ -205,7 +207,7 @@ public class Navigator {
 			lastSmoothed = path.smoothed;
 			executor = new PathExecutor(mc, cfg, model, path);
 			status = Status.RUNNING;
-			if (path.partial) msg("Chemin partiel calculé (§e" + path.nodes.size() + "§r nœuds) — progression vers la frontière chargée…");
+			if (path.partial && replans == 0) msg("Chemin partiel calculé (§e" + path.nodes.size() + "§r nœuds) — progression vers la frontière chargée…");
 			return;
 		}
 
@@ -216,11 +218,11 @@ public class Navigator {
 			switch (sig) {
 				case PATH_END -> {
 					if (goalReached()) arrive();
-					else if (cfg.autoReplan && replans < 64) { replans++; engine = null; beginSearch(); status = Status.COMPUTING; }
+					else if (cfg.autoReplan && replans < 256) { replans++; engine = null; beginSearch(); status = Status.COMPUTING; }
 					else { status = Status.FAILED; failedAt = now; msg("§cImpossible d'atteindre l'objectif.§r"); }
 				}
 				case FALL_UNSAFE -> {
-					if (!cfg.autoReplan || replans >= 64) { status = Status.FAILED; failedAt = now; msg("§cChute trop dangereuse — arrêt.§r"); executor.release(); return; }
+					if (!cfg.autoReplan || replans >= 256) { status = Status.FAILED; failedAt = now; msg("§cChute trop dangereuse — arrêt.§r"); executor.release(); return; }
 					replans++;
 					BlockPos t = executor.target();
 					if (t != null) { tempBlocked.put(t.asLong(), now + 12000); if (model != null) model.invalidate(); }
@@ -228,7 +230,7 @@ public class Navigator {
 					engine = null; beginSearch(); status = Status.COMPUTING;
 				}
 				case STUCK, BLOCKED -> {
-					if (!cfg.autoReplan || replans >= 64) { status = Status.FAILED; failedAt = now; msg("§cBlocage — navigation arrêtée.§r"); executor.release(); return; }
+					if (!cfg.autoReplan || replans >= 256) { status = Status.FAILED; failedAt = now; msg("§cBlocage — navigation arrêtée.§r"); executor.release(); return; }
 					replans++;
 					BlockPos t = executor.target();
 					// Ne bloque le nœud que si c'est un vrai mur (pas un simple dépassement après chute).

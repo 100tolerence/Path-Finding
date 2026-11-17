@@ -51,7 +51,7 @@ public class PathEngine {
 	}
 
 	private static class GNode {
-		int x, y, z, kind; double floor, g, h; GNode parent; Move move; boolean closed;
+		int x, y, z, kind; double floor, g, h, f; GNode parent; Move move; boolean closed;
 		long key() { return BlockPos.asLong(x, y, z); }
 		double f(double w) { return g + w * h; }
 	}
@@ -60,7 +60,44 @@ public class PathEngine {
 	private final AmberConfig cfg;
 	private final PlayerPhysics ph;
 	private final Goal goal;
-	private final Map<Long, GNode> all = new HashMap<>();
+	private final NodeMap all = new NodeMap();
+	private final double w;
+
+	/** Table de hachage open-addressing long -> GNode (aucun boxing, bien plus rapide que HashMap<Long,...>). */
+	private static final class NodeMap {
+		private long[] keys = new long[1 << 14];
+		private GNode[] vals = new GNode[1 << 14];
+		private int size, mask = (1 << 14) - 1;
+		NodeMap() { java.util.Arrays.fill(keys, Long.MIN_VALUE); }
+		private static int hash(long k) { return (int) ((k * 0x9E3779B97F4A7C15L) >>> 32); }
+		GNode get(long k) {
+			int i = hash(k) & mask;
+			while (true) {
+				long kk = keys[i];
+				if (kk == k) return vals[i];
+				if (kk == Long.MIN_VALUE) return null;
+				i = (i + 1) & mask;
+			}
+		}
+		void put(long k, GNode v) {
+			if ((size + 1) * 2 > keys.length) grow();
+			int i = hash(k) & mask;
+			while (true) {
+				long kk = keys[i];
+				if (kk == k) { vals[i] = v; return; }
+				if (kk == Long.MIN_VALUE) { keys[i] = k; vals[i] = v; size++; return; }
+				i = (i + 1) & mask;
+			}
+		}
+		private void grow() {
+			long[] ok = keys; GNode[] ov = vals;
+			keys = new long[ok.length * 2]; vals = new GNode[ok.length * 2];
+			java.util.Arrays.fill(keys, Long.MIN_VALUE);
+			mask = keys.length - 1; size = 0;
+			for (int j = 0; j < ok.length; j++) if (ok[j] != Long.MIN_VALUE) put(ok[j], ov[j]);
+		}
+	}
+
 	private final PriorityQueue<GNode> open;
 	private final GNode start;
 	private GNode best;
@@ -74,9 +111,10 @@ public class PathEngine {
 
 	public PathEngine(WorldModel m, AmberConfig cfg, BlockPos from, Goal goal) {
 		this.m = m; this.cfg = cfg; this.ph = m.phys; this.goal = goal;
+		this.w = Math.max(1.0, cfg.weight);
 		this.stepTol = Math.max(0.6, ph.effectiveStep());
-		this.open = new PriorityQueue<>((a, b) -> {
-			int c = Double.compare(a.f(cfg.weight), b.f(cfg.weight));
+		this.open = new PriorityQueue<>(1024, (a, b) -> {
+			int c = Double.compare(a.f, b.f);
 			return c != 0 ? c : Double.compare(a.h, b.h);
 		});
 		int k = m.kind(from.getX(), from.getY(), from.getZ());
@@ -85,17 +123,18 @@ public class PathEngine {
 		start.x = from.getX(); start.y = from.getY(); start.z = from.getZ();
 		start.kind = k; start.floor = m.floorOf(k, start.x, start.y, start.z);
 		if (Double.isNaN(start.floor)) start.floor = start.y;
-		start.g = 0; start.h = heuristic(start);
+		start.g = 0; start.h = heuristic(start); start.f = w * start.h;
 		all.put(start.key(), start); open.add(start); best = start;
 	}
 
 	private double heuristic(GNode n) {
-		double dx = n.x - goal.x, dz = n.z - goal.z;
-		double d2 = Math.sqrt(dx * dx + dz * dz);
+		// Distance octile (8 directions) : bien plus serree que l'euclidienne -> beaucoup moins de noeuds explores.
+		double dx = Math.abs(n.x - goal.x), dz = Math.abs(n.z - goal.z);
+		double d2 = Math.max(dx, dz) + 0.4142 * Math.min(dx, dz);
 		if (goal.mode == 2) d2 = Math.max(0, d2 - goal.radius);
 		double dy = goal.y == null ? 0 : Math.abs(n.y - goal.y);
 		if (goal.mode == 2 && goal.y != null) dy = Math.max(0, dy - goal.radius);
-		double base = (n.kind == WorldModel.FLY ? ph.flyCost : 2.6) / ph.effSpeed;
+		double base = (n.kind == WorldModel.FLY ? ph.flyCost : 3.0) / ph.effSpeed;
 		return d2 * base + dy * base * 0.85;
 	}
 
@@ -116,9 +155,12 @@ public class PathEngine {
 	public void tick() {
 		if (state != State.SEARCHING) return;
 		long deadline = System.nanoTime() + cfg.budgetMs * 1_000_000L;
+		// Anytime : au-dela de partialAfterMs, on part deja vers le meilleur noeud trouve (replanification en marchant).
+		if (cfg.partialAfterMs > 0 && best != start && best.h < start.h - 3
+				&& System.currentTimeMillis() - startMs > cfg.partialAfterMs) { finish(best, true); return; }
 		int checks = 0;
 		while (!open.isEmpty()) {
-			if ((++checks & 63) == 0 && System.nanoTime() > deadline) return;
+			if ((++checks & 31) == 0 && System.nanoTime() > deadline) return;
 			GNode n = open.poll();
 			if (n.closed || all.get(n.key()) != n) continue;
 			n.closed = true;
@@ -139,7 +181,7 @@ public class PathEngine {
 		GNode n = new GNode();
 		n.x = x; n.y = y; n.z = z; n.kind = kind; n.floor = floor;
 		n.g = ng; n.parent = from; n.move = mv;
-		n.h = heuristic(n);
+		n.h = heuristic(n); n.f = n.g + w * n.h;
 		all.put(key, n); open.add(n);
 	}
 
@@ -269,6 +311,7 @@ public class PathEngine {
 					Move mv = new Move(DESCEND, m.fallTime(drop) + 3 + penalty);
 					mv.drop = drop;
 					offer(n, mv, nx, ty, nz, k, f1);
+					break; // premier atterrissage trouve : inutile de scanner plus bas
 				}
 			}
 
