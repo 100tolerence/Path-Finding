@@ -30,8 +30,8 @@ public class AmberPathClient implements ClientModInitializer {
 		NAV = new Navigator(CONFIG);
 
 		KeyMapping.Category category = KeyMapping.Category.register(Identifier.fromNamespaceAndPath(MOD_ID, "main"));
-		OPEN_KEY = KeyMappingHelper.registerKeyMapping(new KeyMapping("key.amberpath.open", InputConstants.Type.KEYSYM, InputConstants.KEY_G, category));
-		TOGGLE_KEY = KeyMappingHelper.registerKeyMapping(new KeyMapping("key.amberpath.toggle", InputConstants.Type.KEYSYM, InputConstants.KEY_V, category));
+		OPEN_KEY = KeyMappingHelper.registerKeyMapping(new KeyMapping("key.amberpath.open", InputConstants.Type.KEYBOARD, InputConstants.KEY_G, category));
+		TOGGLE_KEY = KeyMappingHelper.registerKeyMapping(new KeyMapping("key.amberpath.toggle", InputConstants.Type.KEYBOARD, InputConstants.KEY_V, category));
 
 		ClientTickEvents.START_CLIENT_TICK.register(mc -> {
 			handleHotkeys(mc);

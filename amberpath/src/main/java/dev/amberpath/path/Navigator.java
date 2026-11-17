@@ -28,6 +28,8 @@ public class Navigator {
 	public int lastExpansions = 0;
 	public long lastComputeMs = 0;
 	public double lastPathLen = 0;
+	public double lastSpeedFactor = 1;
+	public int lastMaxGap = 3;
 
 	private PathEngine engine;
 	private PathExecutor executor;
@@ -37,10 +39,13 @@ public class Navigator {
 	private float lastHealth = 20;
 	private int damageWindow = 0;
 	private int replans = 0;
+	private int refreshTimer = 0;
+	private long retryAt = 0;
 
 	public Navigator(AmberConfig cfg) { this.cfg = cfg; }
 
 	public boolean active() { return status == Status.COMPUTING || status == Status.RUNNING || status == Status.PAUSED; }
+	public PlayerPhysics physics() { return model != null ? model.phys : null; }
 
 	public void msg(String text) {
 		if (mc.player != null) mc.player.sendSystemMessage(Component.literal("§6[AmberPath] §r" + text));
@@ -50,6 +55,7 @@ public class Navigator {
 		if (mc.player == null || mc.level == null) return;
 		this.goal = g;
 		this.replans = 0;
+		this.retryAt = 0;
 		this.lastHealth = mc.player.getHealth();
 		beginSearch();
 		status = Status.COMPUTING;
@@ -64,8 +70,10 @@ public class Navigator {
 	}
 
 	public void toggle() {
-		if (active()) { stop(); msg("Navigation §carrêtée§r."); mc.player.playSound(SoundEvents.UI_BUTTON_CLICK.value(), 0.6f, 0.8f); }
-		else if (goal != null) start(goal);
+		if (active()) {
+			stop(); msg("Navigation §carrêtée§r.");
+			if (mc.player != null) mc.player.playSound(SoundEvents.UI_BUTTON_CLICK.value(), 0.6f, 0.8f);
+		} else if (goal != null) start(goal);
 		else { mc.setScreenAndShow(new AmberPathScreen()); msg("Définissez d'abord une destination (§eG§r par défaut)."); }
 	}
 
@@ -82,6 +90,8 @@ public class Navigator {
 
 	private void beginSearch() {
 		model = new WorldModel(mc.level, mc.player, cfg, tempBlocked.keySet());
+		lastSpeedFactor = model.phys.speedFactor;
+		lastMaxGap = cfg.adaptiveParkour ? Math.max(cfg.maxGap, model.phys.maxGapFlat) : cfg.maxGap;
 		engine = new PathEngine(model, cfg, findStart(), goal);
 	}
 
@@ -103,28 +113,37 @@ public class Navigator {
 		}
 	}
 
-	/** Appelé au début du tick client (avant la physique du joueur). */
 	public void tickStart() {
 		long now = System.currentTimeMillis();
 		tempBlocked.entrySet().removeIf(e -> e.getValue() < now);
-		if (status == Status.IDLE || status == Status.ARRIVED || status == Status.FAILED) return;
+		if (status == Status.IDLE || status == Status.ARRIVED || status == Status.FAILED) {
+			// Réessai auto si l'objectif était hors chunks chargés
+			if (status == Status.FAILED && retryAt > 0 && now >= retryAt && mc.player != null && mc.level != null) {
+				retryAt = 0; beginSearch(); status = Status.COMPUTING;
+			}
+			return;
+		}
 		LocalPlayer p = mc.player;
 		if (p == null || mc.level == null) { stop(); return; }
 		if (p.isDeadOrDying()) { stop(); msg("§cJoueur mort — navigation arrêtée.§r"); return; }
 
-		// Pause automatique (menus, véhicule, dégâts)
+		// Pause auto (menus, véhicule, lévitation, élytre, sommeil, dégâts si activé)
 		boolean menuPause = cfg.pauseInMenus && mc.gui.screen() != null && !(mc.gui.screen() instanceof AmberPathScreen);
 		boolean vehiclePause = p.getVehicle() != null;
+		boolean levPause = p.hasEffect(net.minecraft.world.effect.MobEffects.LEVITATION);
+		boolean elytraPause = p.isFallFlying();
+		boolean sleepPause = p.isSleeping();
 		if (cfg.pauseOnDamage) {
 			if (p.getHealth() < lastHealth - 0.5f) damageWindow = 20;
 			lastHealth = p.getHealth();
 			if (damageWindow > 0) damageWindow--;
 		}
 		boolean damagePause = cfg.pauseOnDamage && damageWindow > 0 && p.getHealth() < p.getMaxHealth() - 1;
-		if (menuPause || vehiclePause || damagePause) {
+		if (menuPause || vehiclePause || levPause || elytraPause || sleepPause || damagePause) {
 			if (status != Status.PAUSED) {
 				status = Status.PAUSED;
-				pauseReason = menuPause ? "menu ouvert" : vehiclePause ? "véhicule" : "dégâts récents";
+				pauseReason = menuPause ? "menu ouvert" : vehiclePause ? "véhicule" : levPause ? "lévitation"
+						: elytraPause ? "élytre" : sleepPause ? "sommeil" : "dégâts récents";
 				if (executor != null) executor.release();
 			}
 			return;
@@ -140,9 +159,15 @@ public class Navigator {
 			lastExpansions = engine.expansions;
 			lastComputeMs = engine.result() != null ? engine.result().timeMs : 0;
 			if (engine.state == PathEngine.State.FAILED || engine.result() == null || engine.result().nodes.size() < 2) {
-				status = Status.FAILED;
-				msg("§cAucun chemin trouvé§r (objectif inaccessible ou hors chunks chargés).");
-				p.playSound(SoundEvents.VILLAGER_NO, 0.6f, 1f);
+				boolean goalLoaded = model.loaded(goal.x, goal.y == null ? Mth_floor(p.getY()) : goal.y, goal.z);
+				if (!goalLoaded && cfg.autoReplan) {
+					status = Status.FAILED; retryAt = now + 1500;
+					msg("Objectif hors chunks chargés — §enouvelle tentative automatique§r…");
+				} else {
+					status = Status.FAILED;
+					msg("§cAucun chemin trouvé§r (objectif inaccessible ou hors chunks chargés).");
+					p.playSound(SoundEvents.VILLAGER_NO, 0.6f, 1f);
+				}
 				return;
 			}
 			path = engine.result();
@@ -154,6 +179,8 @@ public class Navigator {
 		}
 
 		if (status == Status.RUNNING && executor != null) {
+			// Rafraîchit le profil physique live (effets qui expirent, santé, enchantements)
+			if (++refreshTimer >= 40) { refreshTimer = 0; model.refresh(p); }
 			PathExecutor.Signal sig = executor.tick();
 			switch (sig) {
 				case PATH_END -> {
@@ -161,11 +188,21 @@ public class Navigator {
 					else if (cfg.autoReplan && replans < 64) { replans++; beginSearch(); status = Status.COMPUTING; }
 					else { status = Status.FAILED; msg("§cImpossible d'atteindre l'objectif.§r"); }
 				}
+				case FALL_UNSAFE -> {
+					if (!cfg.autoReplan || replans >= 64) { status = Status.FAILED; msg("§cChute trop dangereuse — arrêt.§r"); executor.release(); return; }
+					replans++;
+					BlockPos t = executor.target();
+					if (t != null) tempBlocked.put(t.asLong(), now + 12000);
+					msg("Chute évitée (santé insuffisante) — §erecalcul§r…");
+					beginSearch(); status = Status.COMPUTING;
+				}
 				case STUCK, BLOCKED -> {
 					if (!cfg.autoReplan || replans >= 64) { status = Status.FAILED; msg("§cBlocage — navigation arrêtée.§r"); executor.release(); return; }
 					replans++;
 					BlockPos t = executor.target();
-					if (t != null && sig == PathExecutor.Signal.STUCK) tempBlocked.put(t.asLong(), now + 15000);
+					// Ne bloque le nœud que si c'est un vrai mur (pas un simple dépassement après chute).
+					if (t != null && (sig == PathExecutor.Signal.BLOCKED || executor.stuckByCollision))
+						tempBlocked.put(t.asLong(), now + 15000);
 					beginSearch(); status = Status.COMPUTING;
 				}
 				default -> {}
@@ -186,7 +223,6 @@ public class Navigator {
 		msg("§aArrivé à destination ✓§r  (§e" + goal.x + ", " + (goal.y == null ? "auto" : goal.y) + ", " + goal.z + "§r)");
 	}
 
-	/** Appelé en fin de tick : gizmos du chemin + statistiques HUD. */
 	public void tickEnd() {
 		if (mc.level == null || mc.player == null) return;
 		if (!cfg.showPath || path == null || status != Status.RUNNING || executor == null) return;

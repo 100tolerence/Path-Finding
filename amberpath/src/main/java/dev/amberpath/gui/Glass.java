@@ -1,5 +1,6 @@
 package dev.amberpath.gui;
 
+import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 
 /** Helpers de rendu « liquid glass » marron/ambré, 100 % procédural (aucune texture). */
@@ -148,5 +149,15 @@ public final class Glass {
 			int half = s - Math.abs(dy);
 			ex.fill(cx - half, cy + dy, cx + half + 1, cy + dy + 1, color);
 		}
+	}
+
+	/** Pastille « effet détecté » : pilule ambrée translucide + texte. Renvoie sa largeur. */
+	public static int chip(GuiGraphicsExtractor ex, Font font, int x, int y, String text) {
+		int w = font.width(text) + 12;
+		roundRectGradient(ex, x, y, w, 14, 7, 0x73E8A85C, 0x4DC77F35);
+		roundOutline(ex, x, y, w, 14, 7, 0x66FFE0B0);
+		ex.fill(x + 7, y + 1, x + w - 7, y + 2, 0x33FFFFFF);
+		ex.text(font, text, x + 6, y + 3, CREAM, false);
+		return w;
 	}
 }

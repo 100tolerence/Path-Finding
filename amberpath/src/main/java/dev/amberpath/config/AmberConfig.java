@@ -19,7 +19,10 @@ public class AmberConfig {
 	public boolean doors = true;      // ouvrir portes & portillons en bois
 	public boolean descend = true;
 	public int maxFall = 3;           // chute sans dégâts maximale (blocs)
-	public boolean riskyFalls = false;// autoriser les chutes avec dégâts
+	public boolean riskyFalls = true; // autoriser les chutes avec dégâts (bornées par la santé)
+	public double keepHearts = 1.0;   // cœurs minimum conservés après une chute risquée
+	public boolean adaptiveParkour = true; // portée des sauts adaptée à Speed / Jump Boost
+	public boolean iceParkour = true; // autoriser les sauts depuis la glace
 	public boolean sneakMagma = true;
 	public boolean avoidDanger = true;// lave, feu, cactus, wither rose, poudreuse
 	public boolean flyAuto = true;    // mode vol créatif automatique
@@ -33,7 +36,7 @@ public class AmberConfig {
 
 	// Confort / sécurité
 	public boolean pauseInMenus = true;
-	public boolean pauseOnDamage = true;
+	public boolean pauseOnDamage = false; // les dégâts (chutes, mobs) n'interrompent pas le chemin
 	public boolean showHud = true;
 	public boolean showPath = true;
 	public boolean smoothRotation = true;

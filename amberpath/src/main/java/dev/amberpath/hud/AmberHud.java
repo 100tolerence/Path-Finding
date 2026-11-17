@@ -46,7 +46,7 @@ public class AmberHud implements HudElement {
 		if (nav.status == Navigator.Status.RUNNING) {
 			double d = nav.remainingDistance();
 			double s = nav.remainingTicks() / 20.0;
-			String info = String.format("%.0f m · ~%ds", d, Math.max(1, (int) s));
+			String info = String.format("%.0f m · ~%ds · ×%.1f", d, Math.max(1, (int) s), nav.lastSpeedFactor);
 			ex.text(font, info, x + w - 9 - font.width(info), y + 22, Glass.AMBER, true);
 			float frac = nav.pathNodes() > 1 ? (float) nav.progressIdx() / nav.pathNodes() : 0;
 			Glass.progressBar(ex, x + 9, y + 36, w - 18, 5, frac);

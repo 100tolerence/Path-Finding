@@ -7,11 +7,9 @@ import net.minecraft.core.BlockPos.MutableBlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.FluidTags;
-import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
 import net.minecraft.world.level.block.state.properties.Half;
 import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.world.level.material.FluidState;
@@ -20,36 +18,34 @@ import net.minecraft.world.phys.shapes.VoxelShape;
 import java.util.Set;
 
 /**
- * Modèle du monde : classification des blocs et physique de déplacement Minecraft.
- * Vitesses calibrées (ticks/bloc) : marche 4.63, sprint 3.56, sprint-saut ~2.95,
- * nage ~6, échelle montante 8, descendante 6.7, échafaudage 3.5, vol 2.1.
+ * Modèle du monde : classification des blocs + physique de déplacement issue de
+ * {@link PlayerPhysics} (effets, enchantements, attributs live). Dalles, escaliers,
+ * trappes, neige, sable des âmes, miel, glace, magma, lave (selon Résistance au feu),
+ * eau (Depth Strider / Dolphins Grace), échelles, échafaudages, chutes (budget santé).
  */
 public class WorldModel {
 	public static final int INVALID = 0, GROUND = 1, WATER = 2, LAVA = 3, CLIMB = 4, FLY = 5;
 
 	public final ClientLevel level;
 	public final AmberConfig cfg;
-	public final boolean fireResist;
-	public final boolean canSprint;
-	public final boolean flying;
+	public PlayerPhysics phys;
 	public final Set<Long> tempBlocked;
 	private final MutableBlockPos mp = new MutableBlockPos();
 	private final int minY, maxY;
 
 	public WorldModel(ClientLevel level, Player player, AmberConfig cfg, Set<Long> tempBlocked) {
 		this.level = level; this.cfg = cfg; this.tempBlocked = tempBlocked;
-		this.fireResist = player.hasEffect(MobEffects.FIRE_RESISTANCE);
-		this.canSprint = player.getFoodData().getFoodLevel() > 6 || player.isCreative();
-		this.flying = player.getAbilities().flying;
+		this.phys = PlayerPhysics.of(player);
 		this.minY = level.getMinY();
 		this.maxY = level.getMaxY();
 	}
 
+	/** Rafraîchit le profil physique (effets qui expirent, santé, enchantements). */
+	public void refresh(Player player) { this.phys = PlayerPhysics.of(player); }
+
 	private BlockPos p(int x, int y, int z) { return mp.set(x, y, z); }
 
-	public boolean loaded(int x, int y, int z) {
-		return y >= minY && y < maxY && level.isLoaded(p(x, y, z));
-	}
+	public boolean loaded(int x, int y, int z) { return y >= minY && y < maxY && level.isLoaded(p(x, y, z)); }
 	public BlockState st(int x, int y, int z) { return level.getBlockState(p(x, y, z)); }
 	public boolean water(int x, int y, int z) { return level.getFluidState(p(x, y, z)).is(FluidTags.WATER); }
 	public boolean lava(int x, int y, int z) { return level.getFluidState(p(x, y, z)).is(FluidTags.LAVA); }
@@ -57,10 +53,13 @@ public class WorldModel {
 	public boolean climb(int x, int y, int z) {
 		BlockState s = st(x, y, z);
 		Block b = s.getBlock();
-		return s.is(BlockTags.CLIMBABLE) || b == Blocks.SCAFFOLDING || b == Blocks.TWISTING_VINES || b == Blocks.WEEPING_VINES;
+		return s.is(BlockTags.CLIMBABLE) || b == Blocks.SCAFFOLDING || b == Blocks.TWISTING_VINES
+				|| b == Blocks.TWISTING_VINES_PLANT || b == Blocks.WEEPING_VINES || b == Blocks.WEEPING_VINES_PLANT;
 	}
-	public boolean scaff(int x, int y, int z) { return st(x, y, z).getBlock() == Blocks.SCAFFOLDING; }
-
+	public boolean scaff(int x, int y, int z) {
+		Block b = st(x, y, z).getBlock();
+		return b == Blocks.SCAFFOLDING;
+	}
 	public boolean tall(int x, int y, int z) {
 		BlockState s = st(x, y, z);
 		Block b = s.getBlock();
@@ -70,12 +69,13 @@ public class WorldModel {
 	/** Le corps peut-il occuper cette cellule ? */
 	public boolean passable(int x, int y, int z) {
 		if (!loaded(x, y, z)) return false;
+		if (phys.spectator) return true; // noclip
 		BlockState s = st(x, y, z);
 		if (s.isAir()) return true;
 		FluidState f = s.getFluidState();
 		if (!f.isEmpty()) {
 			if (f.is(FluidTags.WATER)) return cfg.swim;
-			if (f.is(FluidTags.LAVA)) return fireResist && cfg.swim;
+			if (f.is(FluidTags.LAVA)) return phys.fireResist && cfg.swim;
 			return false;
 		}
 		Block b = s.getBlock();
@@ -89,7 +89,7 @@ public class WorldModel {
 		if (s.is(BlockTags.TRAPDOORS)) return s.getValue(TrapDoorBlock.OPEN);
 		if (tall(x, y, z)) return false;
 		if (b == Blocks.CACTUS) return false;
-		if (b == Blocks.FIRE || b == Blocks.SOUL_FIRE) return fireResist;
+		if (b == Blocks.FIRE || b == Blocks.SOUL_FIRE) return phys.fireResist;
 		if (b == Blocks.WITHER_ROSE) return !cfg.avoidDanger;
 		if (b == Blocks.POWDER_SNOW) return false;
 		if (b == Blocks.SWEET_BERRY_BUSH || b == Blocks.COBWEB) return true;
@@ -117,14 +117,14 @@ public class WorldModel {
 		if (s.is(BlockTags.FENCE_GATES)) return s.getValue(FenceGateBlock.OPEN) ? Double.NaN : y + 0.5;
 		if (s.is(BlockTags.TRAPDOORS)) {
 			if (s.getValue(TrapDoorBlock.OPEN)) return Double.NaN;
-			return s.getValue(TrapDoorBlock.HALF) == Half.TOP ? y : y - 0.5;
+			return s.getValue(TrapDoorBlock.HALF) == Half.TOP ? y : y - 0.8125; // trappe basse = 3/16
 		}
 		if (s.is(BlockTags.SLABS)) return s.getValue(SlabBlock.TYPE) == SlabType.BOTTOM ? y - 0.5 : y;
 		if (s.is(BlockTags.STAIRS)) return s.getValue(StairBlock.HALF) == Half.TOP ? y : y - 0.5;
 		if (b == Blocks.SCAFFOLDING) return y;
 		if (b instanceof SnowLayerBlock) {
 			int l = s.getValue(SnowLayerBlock.LAYERS);
-			return l <= 4 ? (y - 1) + l * 0.125 : Double.NaN;
+			return l >= 8 ? y : (y - 1) + l * 0.125;
 		}
 		if (b == Blocks.FARMLAND || b == Blocks.DIRT_PATH || b == Blocks.HONEY_BLOCK) return y - 0.0625;
 		if (b == Blocks.SOUL_SAND) return y - 0.125;
@@ -138,33 +138,48 @@ public class WorldModel {
 
 	public boolean magma(int x, int y, int z) { return st(x, y, z).getBlock() == Blocks.MAGMA_BLOCK; }
 	public boolean honey(int x, int y, int z) { return st(x, y, z).getBlock() == Blocks.HONEY_BLOCK; }
-	public boolean ice(int x, int y, int z) { return st(x, y, z).is(BlockTags.ICE); }
+	public boolean ice(int x, int y, int z) { return st(x, y - 1, z).is(BlockTags.ICE); }
 	public boolean soulSand(int x, int y, int z) { return st(x, y, z).getBlock() == Blocks.SOUL_SAND; }
+	public boolean soulBlock(int x, int y, int z) { return st(x, y, z).is(BlockTags.SOUL_SPEED_BLOCKS); }
+	public boolean dripstone(int x, int y, int z) {
+		return st(x, y, z).getBlock() == Blocks.POINTED_DRIPSTONE || st(x, y - 1, z).getBlock() == Blocks.POINTED_DRIPSTONE;
+	}
 
-	/** Atterrissage qui annule/réduit les dégâts de chute. */
+	/** Atterrissage qui annule les dégâts de chute (eau, slime, toile, poudreuse, baies, lianes…). */
 	public boolean safeLanding(int x, int y, int z) {
 		if (water(x, y, z) || water(x, y - 1, z)) return true;
 		Block b = st(x, y - 1, z).getBlock();
-		if (b == Blocks.HAY_BLOCK || b == Blocks.SLIME_BLOCK || b == Blocks.POWDER_SNOW || b == Blocks.COBWEB) return true;
+		if (b == Blocks.SLIME_BLOCK || b == Blocks.POWDER_SNOW || b == Blocks.COBWEB) return true;
 		Block c = st(x, y, z).getBlock();
-		return c == Blocks.COBWEB || c == Blocks.POWDER_SNOW || st(x, y, z).is(BlockTags.FALL_DAMAGE_RESETTING);
+		if (c == Blocks.COBWEB || c == Blocks.POWDER_SNOW || c == Blocks.SWEET_BERRY_BUSH) return true;
+		return st(x, y, z).is(BlockTags.FALL_DAMAGE_RESETTING) || st(x, y - 1, z).is(BlockTags.FALL_DAMAGE_RESETTING);
+	}
+	public boolean hayHoney(int x, int y, int z) {
+		Block b = st(x, y - 1, z).getBlock();
+		return b == Blocks.HAY_BLOCK || b == Blocks.HONEY_BLOCK;
+	}
+
+	/** Multiplicateur de dégâts de chute pour un atterrissage en (x,y,z). */
+	public double landingMult(int x, int y, int z) {
+		return PlayerPhysics.landingMult(safeLanding(x, y, z), hayHoney(x, y, z), dripstone(x, y, z));
 	}
 
 	/** Type de nœud valide en (x,y,z), ou INVALID. */
 	public int kind(int x, int y, int z) {
 		if (!loaded(x, y, z)) return INVALID;
 		if (tempBlocked.contains(BlockPos.asLong(x, y, z))) return INVALID;
-		if (flying && cfg.flyAuto) {
+		if ((phys.flying && cfg.flyAuto) || phys.spectator) {
 			return passable(x, y, z) ? FLY : INVALID;
 		}
 		if (water(x, y, z)) return cfg.swim && passable(x, y + 1, z) ? WATER : INVALID;
-		if (lava(x, y, z)) return fireResist && cfg.swim && passable(x, y + 1, z) ? LAVA : INVALID;
+		if (lava(x, y, z)) return phys.fireResist && cfg.swim && passable(x, y + 1, z) ? LAVA : INVALID;
 		if (climb(x, y, z)) return cfg.climb && passable(x, y + 1, z) ? CLIMB : INVALID;
 		if (!passable(x, y, z) || !passable(x, y + 1, z)) return INVALID;
 		double f = supportFloor(x, y, z);
 		if (Double.isNaN(f)) return INVALID;
 		if (f > y + 0.001 && !passable(x, y + 2, z)) return INVALID; // sommet de clôture
 		if (cfg.avoidDanger && !cfg.sneakMagma && magma(x, y - 1, z)) return INVALID;
+		if (cfg.avoidDanger && dripstone(x, y, z)) return INVALID;
 		return GROUND;
 	}
 
@@ -186,14 +201,31 @@ public class WorldModel {
 		return extra;
 	}
 
+	/** Facteur de vitesse de surface (sable des âmes + Soul Speed, miel, glace, magma accroupi). */
 	public double surfaceFactor(int x, int y, int z) {
-		Block b = st(x, y - 1, z).getBlock();
-		if (b == Blocks.SOUL_SAND) return 2.1;
+		BlockState below = st(x, y - 1, z);
+		Block b = below.getBlock();
+		if (below.is(BlockTags.SOUL_SPEED_BLOCKS)) {
+			if (phys.soulSpeed > 0) return 1.0 / (1.0 + 0.105 * phys.soulSpeed);
+			return b == Blocks.SOUL_SAND ? 2.0 : 1.0;
+		}
 		if (b == Blocks.HONEY_BLOCK) return 2.4;
-		if (st(x, y - 1, z).is(BlockTags.ICE)) return 0.95;
-		if (magma(x, y - 1, z) && cfg.sneakMagma) return 2.6;
+		if (below.is(BlockTags.ICE)) return 0.9;
+		if (magma(x, y - 1, z) && cfg.sneakMagma) return 1.0 / phys.sneakFactor;
 		return 1.0;
 	}
 
-	public static double fallTime(double d) { return 2.2 * Math.sqrt(Math.max(0, d)) + 3; }
+	/** Temps de chute (ticks) — Slow Falling ralentit fortement. */
+	public double fallTime(double d) {
+		if (phys.slowFalling) return d / 0.15 + 6;
+		return 2.2 * Math.sqrt(Math.max(0, d)) + 3;
+	}
+
+	/** Hauteur de chute maximale autorisée par la config + le budget santé live. */
+	public double maxDrop() {
+		if (!cfg.descend) return 0;
+		double free = Math.max(cfg.maxFall, phys.safeFall);
+		if (!cfg.riskyFalls) return free;
+		return Math.max(free, phys.maxSafeDrop(cfg.keepHearts));
+	}
 }

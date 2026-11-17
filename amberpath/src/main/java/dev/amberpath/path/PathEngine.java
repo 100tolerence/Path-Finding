@@ -10,10 +10,12 @@ import java.util.Map;
 import java.util.PriorityQueue;
 
 /**
- * A* incrémental (budget temps par tick) sur grille de blocs, avec mouvements
- * calibrés sur la physique Minecraft. Poids configurable (optimal ↔ rapide).
- * Si l'objectif est hors chunks chargés / budget, renvoie un chemin partiel
- * vers la frontière la plus proche du but (replanification automatique).
+ * A* incrémental (budget temps par tick) sur grille de blocs. Les mouvements sont
+ * dérivés de {@link PlayerPhysics} : la portée des sauts parkour grandit avec Speed
+ * (même niveau 255), la montée avec Jump Boost, les chutes sont bornées par le budget
+ * santé (Feather Falling / Slow Falling / atterrissage eau/foin/slime). Les mobs sont
+ * ignorés. Si l'objectif est hors chunks chargés, renvoie un chemin partiel vers la
+ * frontière (replanification automatique).
  */
 public class PathEngine {
 	public enum State { SEARCHING, FOUND, PARTIAL, FAILED }
@@ -23,6 +25,7 @@ public class PathEngine {
 
 	public static class Move {
 		public int type; public double cost; public int gap; public boolean sprint; public boolean door;
+		public double drop; // hauteur de chute (DESCEND) pour garde santé live
 		Move(int type, double cost) { this.type = type; this.cost = cost; }
 	}
 
@@ -33,7 +36,7 @@ public class PathEngine {
 	}
 
 	public static class Goal {
-		public int mode; public int x, z; public Integer y; public int radius;
+		public final int mode, x, z, radius; public final Integer y;
 		public Goal(int mode, int x, Integer y, int z, int radius) {
 			this.mode = mode; this.x = x; this.y = y; this.z = z; this.radius = radius;
 		}
@@ -47,10 +50,11 @@ public class PathEngine {
 
 	private final WorldModel m;
 	private final AmberConfig cfg;
+	private final PlayerPhysics ph;
 	private final Goal goal;
-	private final GNode start;
 	private final Map<Long, GNode> all = new HashMap<>();
 	private final PriorityQueue<GNode> open;
+	private final GNode start;
 	private GNode best;
 	public State state = State.SEARCHING;
 	public int expansions = 0;
@@ -60,7 +64,7 @@ public class PathEngine {
 	private static final int[][] DIRS = {{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
 
 	public PathEngine(WorldModel m, AmberConfig cfg, BlockPos from, Goal goal) {
-		this.m = m; this.cfg = cfg; this.goal = goal;
+		this.m = m; this.cfg = cfg; this.ph = m.phys; this.goal = goal;
 		this.open = new PriorityQueue<>((a, b) -> {
 			int c = Double.compare(a.f(cfg.weight), b.f(cfg.weight));
 			return c != 0 ? c : Double.compare(a.h, b.h);
@@ -81,26 +85,24 @@ public class PathEngine {
 		if (goal.mode == 2) d2 = Math.max(0, d2 - goal.radius);
 		double dy = goal.y == null ? 0 : Math.abs(n.y - goal.y);
 		if (goal.mode == 2 && goal.y != null) dy = Math.max(0, dy - goal.radius);
-		return d2 * 2.6 + dy * 2.2;
+		double base = (n.kind == WorldModel.FLY ? ph.flyCost : 2.6) / ph.speedFactor;
+		return d2 * base + dy * base * 0.85;
 	}
 
 	private boolean isGoal(GNode n) {
-		if (n.x != goal.x && goal.mode != 2) return false;
-		if (n.z != goal.z && goal.mode != 2) return false;
 		switch (goal.mode) {
-			case 0: // se tenir dessus
+			case 0:
 				if (n.x != goal.x || n.z != goal.z || n.kind != WorldModel.GROUND) return false;
 				return goal.y == null || Math.abs(n.floor - (goal.y + 1)) < 0.75;
-			case 1: // atteindre
+			case 1:
 				return n.x == goal.x && n.z == goal.z && (goal.y == null || n.y == goal.y);
-			default: // approcher
+			default:
 				double dx = n.x - goal.x, dz = n.z - goal.z;
 				if (dx * dx + dz * dz > (double) goal.radius * goal.radius) return false;
 				return goal.y == null || Math.abs(n.y - goal.y) <= goal.radius;
 		}
 	}
 
-	/** Étend la recherche dans la limite du budget temps. */
 	public void tick() {
 		if (state != State.SEARCHING) return;
 		long deadline = System.nanoTime() + cfg.budgetMs * 1_000_000L;
@@ -131,18 +133,23 @@ public class PathEngine {
 		all.put(key, n); open.add(n);
 	}
 
+	private int gapFlat() { return cfg.adaptiveParkour ? Math.max(cfg.maxGap, ph.maxGapFlat) : cfg.maxGap; }
+	private int gapDown() { return cfg.adaptiveParkour ? Math.max(cfg.maxGap + 1, ph.maxGapDown) : cfg.maxGap + 1; }
+
 	private void expand(GNode n) {
 		if (n.kind == WorldModel.FLY) { expandFly(n); return; }
-		boolean sprintOk = cfg.sprint && m.canSprint;
+		boolean sprintOk = cfg.sprint && ph.canSprint;
 		boolean honeyBelow = m.honey(n.x, n.y - 1, n.z);
-		boolean iceBelow = m.ice(n.x, n.y - 1, n.z);
+		boolean iceBelow = m.ice(n.x, n.y, n.z);
 		double f0 = n.floor;
+		double walkBase = sprintOk ? ph.sprintCost : ph.walkCost;
+		double budget = ph.health + ph.absorption - 2.0 * cfg.keepHearts;
 
-		// Mouvements verticaux (nage / escalade)
+		// --- Mouvements verticaux (escalade / nage) ---
 		if (n.kind == WorldModel.CLIMB) {
 			int ku = m.kind(n.x, n.y + 1, n.z);
 			if (ku == WorldModel.CLIMB) offer(n, new Move(CLIMB_UP, 8), n.x, n.y + 1, n.z, ku, n.y + 1);
-			else if (ku == WorldModel.GROUND) { Move mv = new Move(CLIMB_UP, 11); offer(n, mv, n.x, n.y + 1, n.z, ku, m.floorOf(ku, n.x, n.y + 1, n.z)); }
+			else if (ku == WorldModel.GROUND) offer(n, new Move(CLIMB_UP, 11), n.x, n.y + 1, n.z, ku, m.floorOf(ku, n.x, n.y + 1, n.z));
 			int kd = m.kind(n.x, n.y - 1, n.z);
 			if (kd == WorldModel.CLIMB) {
 				boolean sc = m.scaff(n.x, n.y, n.z);
@@ -150,7 +157,7 @@ public class PathEngine {
 			}
 		}
 		if (n.kind == WorldModel.WATER || n.kind == WorldModel.LAVA) {
-			double base = n.kind == WorldModel.LAVA ? 11 : (m.water(n.x, n.y + 1, n.z) ? 6.0 : 4.8);
+			double base = n.kind == WorldModel.LAVA ? ph.lavaCost : (m.water(n.x, n.y + 1, n.z) ? ph.swimCost : ph.swimCost * 0.8);
 			int ku = m.kind(n.x, n.y + 1, n.z);
 			if (ku == WorldModel.WATER || ku == WorldModel.LAVA) offer(n, new Move(SWIM, base + 1), n.x, n.y + 1, n.z, ku, n.y + 1);
 			else if (ku == WorldModel.GROUND && m.floorOf(ku, n.x, n.y + 1, n.z) <= n.y + 1.2)
@@ -158,6 +165,9 @@ public class PathEngine {
 			int kd = m.kind(n.x, n.y - 1, n.z);
 			if (kd == WorldModel.WATER || kd == WorldModel.LAVA) offer(n, new Move(SWIM, base), n.x, n.y - 1, n.z, kd, n.y - 1);
 		}
+
+		int maxDrop = (int) Math.min(64, m.maxDrop());
+		int clearanceTop = Math.min(8, (int) Math.ceil(ph.jumpPeak) + 1);
 
 		for (int[] d : DIRS) {
 			int dx = d[0], dz = d[1];
@@ -168,8 +178,9 @@ public class PathEngine {
 					|| !m.passable(n.x, n.y, nz) || !m.passable(n.x, n.y + 1, nz))) continue;
 			double dirF = diag ? 1.4142 : 1.0;
 
+			// --- Nage horizontale ---
 			if (n.kind == WorldModel.WATER || n.kind == WorldModel.LAVA) {
-				double base = n.kind == WorldModel.LAVA ? 11 : (m.water(n.x, n.y + 1, n.z) ? 6.0 : 4.8);
+				double base = n.kind == WorldModel.LAVA ? ph.lavaCost : (m.water(n.x, n.y + 1, n.z) ? ph.swimCost : ph.swimCost * 0.8);
 				for (int ty = n.y + 1; ty >= n.y - 1; ty--) {
 					int k = m.kind(nx, ty, nz);
 					if (k == WorldModel.WATER || k == WorldModel.LAVA)
@@ -180,8 +191,8 @@ public class PathEngine {
 				continue;
 			}
 
-			// Marche / montée / chute vers la colonne voisine
-			int maxDrop = cfg.riskyFalls ? 20 : Math.max(cfg.maxFall, 3);
+			// --- Marche / montée / chute vers la colonne voisine ---
+			boolean nextWalk = false;
 			for (int ty = n.y + 1; ty >= n.y - maxDrop; ty--) {
 				if (ty < n.y && !m.passable(nx, ty + 1, nz)) break; // gaine de chute obstruée
 				int k = m.kind(nx, ty, nz);
@@ -190,7 +201,7 @@ public class PathEngine {
 				if (k == WorldModel.WATER || k == WorldModel.LAVA) {
 					if (ty <= n.y && cfg.swim) {
 						double drop = Math.max(0, f0 - ty);
-						offer(n, new Move(SWIM, WorldModel.fallTime(drop) + 3), nx, ty, nz, k, ty);
+						offer(n, new Move(SWIM, m.fallTime(drop) + 3), nx, ty, nz, k, ty);
 					}
 					continue;
 				}
@@ -200,32 +211,43 @@ public class PathEngine {
 				}
 				// GROUND
 				double df = f1 - f0;
-				if (ty == n.y && Math.abs(df) <= 0.6) {
+				if (ty == n.y && Math.abs(df) <= Math.max(0.6, ph.stepHeight)) {
 					double slow = m.surfaceFactor(nx, ty, nz) * m.surfaceFactor(n.x, n.y, n.z);
-					double cost = (sprintOk ? 3.56 : 4.63) * dirF * Math.max(1, slow) + m.cellExtra(nx, ty, nz);
+					double cost = walkBase * dirF * Math.max(1, slow) + m.cellExtra(nx, ty, nz);
 					Move mv = new Move(WALK, cost);
 					mv.sprint = sprintOk; mv.door = m.doorClosed(nx, ty, nz);
 					offer(n, mv, nx, ty, nz, k, f1);
-				} else if (df > 0.6 && df <= 1.25 && ty == n.y + 1 && !honeyBelow && m.passable(n.x, n.y + 2, n.z)) {
+					nextWalk = true;
+				} else if (df > 0.6 && df <= Math.min(1.25, ph.jumpPeak - 0.05) && ty == n.y + 1 && !honeyBelow && m.passable(n.x, n.y + 2, n.z)) {
 					Move mv = new Move(ASCEND, sprintOk ? 10 : 11);
 					mv.sprint = sprintOk;
 					offer(n, mv, nx, ty, nz, k, f1);
 				} else if (df < -0.6 && cfg.descend) {
 					double drop = -df;
-					boolean safe = m.safeLanding(nx, ty, nz);
-					if (drop > cfg.maxFall && !safe && !cfg.riskyFalls) continue;
-					double penalty = 0;
-					if (drop > 3.5 && !safe) penalty = 25 * (drop - 3);
-					Move mv = new Move(DESCEND, WorldModel.fallTime(drop) + 3 + penalty);
+					double mult = m.landingMult(nx, ty, nz);
+					double dmg = ph.fallDamage(drop) * mult;
+					boolean safe = mult == 0;
+					if (!safe && !cfg.riskyFalls && drop > cfg.maxFall) continue;
+					if (dmg > 0 && dmg >= budget) continue; // ne jamais mourir
+					double penalty = dmg > 0 ? dmg * 8 : (drop > 3.5 ? 6 * (drop - 3) : 0);
+					Move mv = new Move(DESCEND, m.fallTime(drop) + 3 + penalty);
+					mv.drop = drop;
 					offer(n, mv, nx, ty, nz, k, f1);
 				}
 			}
 
-			// Parkour : sprint-saut au-dessus du vide
-			if (cfg.parkour && sprintOk && !honeyBelow && !iceBelow && n.kind == WorldModel.GROUND
-					&& m.passable(n.x, n.y + 2, n.z)) {
+			// --- Parkour (sprint-saut) : seulement si utile (vide ou montée) ---
+			if (!cfg.parkour || !sprintOk || honeyBelow || n.kind != WorldModel.GROUND) continue;
+			if (iceBelow && !cfg.iceParkour) continue;
+			if (!m.passable(n.x, n.y + 2, n.z)) continue;
+			double iceF = iceBelow ? 1.2 : 1.0;
+			int gFlat = (int) (gapFlat() * iceF);
+			int gDown = (int) (gapDown() * iceF);
+
+			// Saut plat / descendant au-dessus du vide (inutile si la case voisine se marche)
+			if (!nextWalk) {
 				for (int dy = 0; dy >= -1; dy--) {
-					int maxD = dy == 0 ? cfg.maxGap + 1 : cfg.maxGap + 2;
+					int maxD = (dy == 0 ? gFlat : gDown) + 1;
 					for (int D = 2; D <= maxD; D++) {
 						int tx = n.x + dx * D, tz = n.z + dz * D;
 						int k = m.kind(tx, n.y + dy, tz);
@@ -233,32 +255,45 @@ public class PathEngine {
 						double f1 = m.floorOf(k, tx, n.y + dy, tz);
 						double df = f1 - f0;
 						if (dy == 0 && Math.abs(df) > 0.6) continue;
-						if (dy == -1 && (df > -0.4 || df < -2.6)) continue;
-						boolean clear = true;
-						for (int c = 1; c < D; c++) {
-							int cx = n.x + dx * c, cz = n.z + dz * c;
-							if (!m.passable(cx, n.y + 1, cz) || !m.passable(cx, n.y + 2, cz)) { clear = false; break; }
-						}
-						if (!clear) continue;
-						Move mv = new Move(PARKOUR, D * 2.95 + 5 + 2);
+						if (dy == -1 && (df > -0.4 || df < -(gDown > 4 ? 4.5 : 2.6))) continue;
+						if (!clearPath(n, dx, dz, D, clearanceTop)) continue;
+						Move mv = new Move(PARKOUR, D * ph.sprintJumpCost + 5 + 2);
 						mv.gap = D; mv.sprint = true;
 						offer(n, mv, tx, n.y + dy, tz, k, f1);
 					}
 				}
-				// saut 1 bloc vers le haut avec élan (1-gap +1)
-				if (cfg.maxGap >= 1) {
-					int tx = n.x + dx * 2, tz = n.z + dz * 2;
-					int k = m.kind(tx, n.y + 1, tz);
-					if (k == WorldModel.GROUND && m.passable(n.x + dx, n.y + 1, n.z + dz) && m.passable(n.x + dx, n.y + 2, n.z + dz)) {
-						double f1 = m.floorOf(k, tx, n.y + 1, tz);
-						if (f1 - f0 > 0.6 && f1 - f0 <= 1.6) {
-							Move mv = new Move(PARKOUR, 2 * 2.95 + 8); mv.gap = 2; mv.sprint = true;
-							offer(n, mv, tx, n.y + 1, tz, k, f1);
-						}
-					}
+			}
+			// Saut montant (+1..+maxAscend) avec élan
+			int maxUp = ph.maxAscend;
+			for (int R = 1; R <= maxUp; R++) {
+				if (R >= 2 && ph.jumpPeak < R + 0.3) continue;
+				int minD = R >= 2 ? 2 : 2;
+				int maxD = gFlat + 1;
+				for (int D = minD; D <= maxD; D++) {
+					int tx = n.x + dx * D, tz = n.z + dz * D;
+					int k = m.kind(tx, n.y + R, tz);
+					if (k != WorldModel.GROUND) continue;
+					double f1 = m.floorOf(k, tx, n.y + R, tz);
+					double df = f1 - f0;
+					if (df < R - 0.6 || df > R + 0.35) continue;
+					if (!clearPath(n, dx, dz, D, clearanceTop + R)) continue;
+					Move mv = new Move(PARKOUR, D * ph.sprintJumpCost + 8 + R * 2);
+					mv.gap = D; mv.sprint = true;
+					offer(n, mv, tx, n.y + R, tz, k, f1);
 				}
 			}
 		}
+	}
+
+	/** Vérifie que le couloir de saut est libre jusqu'au pic (haut plafond si Jump Boost). */
+	private boolean clearPath(GNode n, int dx, int dz, int D, int top) {
+		for (int c = 1; c < D; c++) {
+			int cx = n.x + dx * c, cz = n.z + dz * c;
+			for (int k = 1; k <= top; k++) {
+				if (!m.passable(cx, n.y + k, cz)) return false;
+			}
+		}
+		return true;
 	}
 
 	private void expandFly(GNode n) {
@@ -268,7 +303,7 @@ public class PathEngine {
 			int k = m.kind(nx, ny, nz);
 			if (k == WorldModel.INVALID) continue;
 			double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-			offer(n, new Move(FLY, 2.1 * dist), nx, ny, nz, k, ny);
+			offer(n, new Move(FLY, ph.flyCost * dist), nx, ny, nz, k, ny);
 		}
 	}
 
