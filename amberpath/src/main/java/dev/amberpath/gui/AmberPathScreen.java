@@ -47,7 +47,7 @@ public class AmberPathScreen extends Screen {
 	private PlayerPhysics livePhysics() {
 		if (minecraft.player == null) return null;
 		long now = System.currentTimeMillis();
-		if (physCache == null || now - physAt > 250) { physCache = PlayerPhysics.of(minecraft.player); physAt = now; }
+		if (physCache == null || now - physAt > 250) { physCache = PlayerPhysics.of(minecraft.player, cfg); physAt = now; }
 		return physCache;
 	}
 
@@ -205,6 +205,17 @@ public class AmberPathScreen extends Screen {
 
 	@Override public boolean isPauseScreen() { return false; }
 
+	/** Flou + assombrissement vanilla, protégé : un seul flou par frame est autorisé par le moteur. */
+	@Override
+	public void extractBackground(GuiGraphicsExtractor ex, int mx, int my, float delta) {
+		try {
+			super.extractBackground(ex, mx, my, delta);
+		} catch (IllegalStateException alreadyBlurred) {
+			// Un flou a déjà été demandé dans cette frame (ex. rendu immédiat de setScreenAndShow) : on l'ignore.
+			ex.fill(0, 0, width, height, 0x66000000);
+		}
+	}
+
 	@Override public void tick() {
 		startBtn.setMessage(Component.literal(nav().active() ? "■  Arrêter la navigation" : "▶  Démarrer la navigation"));
 		radiusSlider.visible = tab == 0 && cfg.goalMode == 2;
@@ -232,9 +243,8 @@ public class AmberPathScreen extends Screen {
 
 	@Override
 	public void extractRenderState(GuiGraphicsExtractor ex, int mx, int my, float delta) {
-		this.extractBackground(ex, mx, my, delta);
-		ex.blurBeforeThisStratum();
-		ex.nextStratum();
+		// Le flou d'arrière-plan est géré UNE seule fois par extractBackground (voir plus bas) :
+		// Minecraft 26.x interdit plus d'un flou par frame (IllegalStateException sinon).
 		var font = minecraft.font;
 
 		Glass.glassPanel(ex, px, py, PW, PH, 14);
