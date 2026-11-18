@@ -36,6 +36,7 @@ public class Navigator {
 	private PathEngine engine;
 	private PathExecutor executor;
 	private PathEngine.PathResult path;
+	private PathEngine.PathResult queuedPath;
 	private WorldModel model;
 	private final Map<Long, Long> tempBlocked = new HashMap<>();
 	private float lastHealth = 20;
@@ -60,12 +61,16 @@ public class Navigator {
 
 	public void start(PathEngine.Goal g) {
 		if (mc.player == null || mc.level == null) return;
+		// La politique de navigation est fixe : aucun ancien fichier de config
+		// ne doit pouvoir remettre un mode lent ou une recherche approximative.
+		cfg.enforceNavigationPolicy();
 		this.goal = g;
 		this.replans = 0;
 		this.retryAt = 0;
 		this.manualPause = false;
 		this.lastHealth = mc.player.getHealth();
 		this.engine = null;
+		this.queuedPath = null;
 		this.status = Status.COMPUTING;
 		mc.player.playSound(SoundEvents.EXPERIENCE_ORB_PICKUP, 0.7f, 1.4f);
 		msg("Navigation vers §e" + g.x + ", " + (g.y == null ? "auto" : g.y) + ", " + g.z + "§r…");
@@ -74,7 +79,7 @@ public class Navigator {
 	public void stop() {
 		if (executor != null) executor.release();
 		status = Status.IDLE;
-		engine = null; executor = null; path = null;
+		engine = null; executor = null; path = null; queuedPath = null;
 		manualPause = false;
 	}
 
@@ -123,6 +128,30 @@ public class Navigator {
 		return true;
 	}
 
+	/** Pré-calcule le segment suivant depuis la frontière du segment actif. */
+	private boolean beginLookahead(BlockPos from) {
+		if (from == null || model == null || goal == null) return false;
+		engine = new PathEngine(model, cfg, from, goal);
+		queuedPath = null;
+		return true;
+	}
+
+	private boolean usable(PathEngine.PathResult candidate) {
+		return candidate != null && candidate.nodes != null && candidate.nodes.size() >= 2;
+	}
+
+	/** Active un segment et lance immédiatement le calcul du suivant en arrière-plan. */
+	private boolean activatePath(PathEngine.PathResult candidate) {
+		if (!usable(candidate)) return false;
+		path = candidate;
+		lastPathLen = path.cost;
+		lastSmoothed = path.smoothed;
+		executor = new PathExecutor(mc, cfg, model, path);
+		status = Status.RUNNING;
+		if (path.partial) beginLookahead(path.nodes.get(path.nodes.size() - 1));
+		return true;
+	}
+
 	private boolean goalReached() {
 		LocalPlayer p = mc.player;
 		if (goal == null) return false;
@@ -143,6 +172,7 @@ public class Navigator {
 	}
 
 	public void tickStart() {
+		cfg.enforceNavigationPolicy();
 		long now = System.currentTimeMillis();
 		tempBlocked.entrySet().removeIf(e -> e.getValue() < now);
 		if (cfg.skyblockAuto && ++sbTimer >= 20) { sbTimer = 0; SkyblockHelper.refresh(mc, cfg); }
@@ -185,12 +215,14 @@ public class Navigator {
 		if (goalReached()) { arrive(); return; }
 
 		if (status == Status.COMPUTING) {
-			if (engine == null && !beginSearch()) return; // attend un point de départ valide
+			if (engine == null && !beginSearch()) return;
 			engine.tick();
 			if (engine.state == PathEngine.State.SEARCHING) return;
 			lastExpansions = engine.expansions;
 			lastComputeMs = engine.result() != null ? engine.result().timeMs : 0;
-			if (engine.state == PathEngine.State.FAILED || engine.result() == null || engine.result().nodes.size() < 2) {
+			PathEngine.PathResult computed = engine.result();
+			engine = null;
+			if (!activatePath(computed)) {
 				boolean goalLoaded = model.loaded(goal.x, goal.y == null ? Mth_floor(p.getY()) : goal.y, goal.z);
 				if (!goalLoaded && cfg.autoReplan) {
 					status = Status.FAILED; failedAt = now; retryAt = now + 1500;
@@ -202,23 +234,41 @@ public class Navigator {
 				}
 				return;
 			}
-			path = engine.result();
-			lastPathLen = path.cost;
-			lastSmoothed = path.smoothed;
-			executor = new PathExecutor(mc, cfg, model, path);
-			status = Status.RUNNING;
-			if (path.partial && replans == 0) msg("Chemin partiel calculé (§e" + path.nodes.size() + "§r nœuds) — progression vers la frontière chargée…");
+			if (path.partial && replans == 0) msg("Navigation lancée — calcul du prochain segment en arrière-plan…");
 			return;
 		}
 
 		if (status == Status.RUNNING && executor != null) {
+			// Recherche en avance pendant que le joueur suit le segment courant.
+			if (engine != null && queuedPath == null) {
+				engine.tick();
+				if (engine.state != PathEngine.State.SEARCHING) {
+					lastExpansions = engine.expansions;
+					lastComputeMs = engine.result() != null ? engine.result().timeMs : 0;
+					queuedPath = engine.result();
+					engine = null;
+				}
+			}
 			// Rafraîchit le profil physique live (effets qui expirent, santé, enchantements, ✦ Speed)
 			if (++refreshTimer >= 40) { refreshTimer = 0; model.refresh(p); }
 			PathExecutor.Signal sig = executor.tick();
 			switch (sig) {
 				case PATH_END -> {
 					if (goalReached()) arrive();
-					else if (cfg.autoReplan && replans < 256) { replans++; engine = null; beginSearch(); status = Status.COMPUTING; }
+					else if (queuedPath != null && usable(queuedPath)) {
+						PathEngine.PathResult next = queuedPath;
+						queuedPath = null;
+						activatePath(next);
+					}
+					else if (engine != null) {
+						// Le segment est terminé avant le calcul anticipé : on attend ce calcul sans immobiliser le moteur.
+						executor = null;
+						status = Status.COMPUTING;
+					}
+					else if (cfg.autoReplan && replans < 256) {
+						replans++; executor = null; queuedPath = null;
+						status = Status.COMPUTING;
+					}
 					else { status = Status.FAILED; failedAt = now; msg("§cImpossible d'atteindre l'objectif.§r"); }
 				}
 				case FALL_UNSAFE -> {
@@ -227,7 +277,7 @@ public class Navigator {
 					BlockPos t = executor.target();
 					if (t != null) { tempBlocked.put(t.asLong(), now + 12000); if (model != null) model.invalidate(); }
 					msg("Chute évitée (santé insuffisante) — §erecalcul§r…");
-					engine = null; beginSearch(); status = Status.COMPUTING;
+					engine = null; queuedPath = null; executor = null; beginSearch(); status = Status.COMPUTING;
 				}
 				case STUCK, BLOCKED -> {
 					if (!cfg.autoReplan || replans >= 256) { status = Status.FAILED; failedAt = now; msg("§cBlocage — navigation arrêtée.§r"); executor.release(); return; }
@@ -238,7 +288,7 @@ public class Navigator {
 						tempBlocked.put(t.asLong(), now + 15000);
 						if (model != null) model.invalidate();
 					}
-					engine = null; beginSearch(); status = Status.COMPUTING;
+					engine = null; queuedPath = null; executor = null; beginSearch(); status = Status.COMPUTING;
 				}
 				default -> {}
 			}
@@ -249,7 +299,7 @@ public class Navigator {
 		if (executor != null) executor.release();
 		status = Status.ARRIVED;
 		arrivedAt = System.currentTimeMillis();
-		executor = null; path = null;
+		executor = null; path = null; engine = null; queuedPath = null;
 		LocalPlayer p = mc.player;
 		if (p != null) {
 			p.playSound(SoundEvents.EXPERIENCE_ORB_PICKUP, 0.9f, 1.0f);

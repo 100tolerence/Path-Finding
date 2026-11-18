@@ -199,7 +199,7 @@ public class PathExecutor {
 		float desiredPitch = verticalAim
 				? Mth.clamp((float) -Math.toDegrees(Math.atan2(dy + (tk == WorldModel.CLIMB ? 0.4 : 0), Math.max(0.3, dist2))), -80, 80)
 				: (mv.type == PathEngine.CLIMB_DOWN ? 70f : p.getXRot());
-		aim(p, desiredYaw, desiredPitch, cfg.smoothRotation, v);
+		aim(p, desiredYaw, desiredPitch, true, v);
 		float err = Math.abs(Mth.wrapDegrees(desiredYaw - p.getYRot()));
 		boolean aligned = err < (mv.type == PathEngine.PARKOUR ? 16 : 50);
 
@@ -289,7 +289,7 @@ public class PathExecutor {
 
 	private void aim(LocalPlayer p, float yaw, float pitch, boolean smooth, double v) {
 		// Rotation lissee a chaque IMAGE (voir AimController / AmberHud), pas seulement a chaque tick.
-		aim.setTarget(yaw, pitch, smooth, v, cfg.turnSpeed);
+		aim.setTarget(yaw, pitch, true, v, 1.0);
 		aim.tickFallback(p);
 	}
 

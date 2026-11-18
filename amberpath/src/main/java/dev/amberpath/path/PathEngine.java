@@ -111,7 +111,7 @@ public class PathEngine {
 
 	public PathEngine(WorldModel m, AmberConfig cfg, BlockPos from, Goal goal) {
 		this.m = m; this.cfg = cfg; this.ph = m.phys; this.goal = goal;
-		this.w = Math.max(1.0, cfg.weight);
+		this.w = 1.0; // A* non pondéré : priorité au coût réel estimé, sans raccourci sous-optimal
 		this.stepTol = Math.max(0.6, ph.effectiveStep());
 		this.open = new PriorityQueue<>(1024, (a, b) -> {
 			int c = Double.compare(a.f, b.f);
@@ -128,14 +128,24 @@ public class PathEngine {
 	}
 
 	private double heuristic(GNode n) {
-		// Distance octile (8 directions) : bien plus serree que l'euclidienne -> beaucoup moins de noeuds explores.
-		double dx = Math.abs(n.x - goal.x), dz = Math.abs(n.z - goal.z);
-		double d2 = Math.max(dx, dz) + 0.4142 * Math.min(dx, dz);
-		if (goal.mode == 2) d2 = Math.max(0, d2 - goal.radius);
-		double dy = goal.y == null ? 0 : Math.abs(n.y - goal.y);
-		if (goal.mode == 2 && goal.y != null) dy = Math.max(0, dy - goal.radius);
-		double base = (n.kind == WorldModel.FLY ? ph.flyCost : 3.0) / ph.effSpeed;
-		return d2 * base + dy * base * 0.85;
+		// Borne inferieure admissible : la recherche reste optimale meme si le meilleur
+		// itineraire traverse eau, vol ou parkour. Une heuristique trop agressive
+		// surestime le cout et peut faire sortir A* du comportement optimal.
+		double dx = Math.abs((double) n.x - goal.x);
+		double dz = Math.abs((double) n.z - goal.z);
+		double horizontal = Math.hypot(dx, dz);
+		double vertical = goal.y == null ? 0.0 : Math.abs((double) n.y - goal.y);
+		if (goal.mode == 2) {
+			horizontal = Math.max(0.0, horizontal - goal.radius);
+			vertical = Math.max(0.0, vertical - goal.radius);
+			// La zone d'arrivee est un cylindre : cette borne reste optimiste.
+			vertical = Math.max(0.0, vertical);
+		}
+		double distance = Math.hypot(horizontal, vertical);
+		double minCostPerBlock = Math.min(ph.sprintJumpCost,
+				Math.min(ph.swimCost, ph.flyCost));
+		minCostPerBlock = Math.max(0.001, minCostPerBlock);
+		return distance * minCostPerBlock;
 	}
 
 	private boolean isGoal(GNode n) {
@@ -177,7 +187,10 @@ public class PathEngine {
 		long key = BlockPos.asLong(x, y, z);
 		double ng = from.g + mv.cost;
 		GNode ex = all.get(key);
-		if (ex != null && (ex.closed || ex.g <= ng + 1e-6)) return;
+		// Ne jamais figer definitivement un noeud ferme : les couts varient selon
+		// le terrain (eau, glace, portes, etc.) et l'heuristique admissible n'est
+		// pas forcement consistante. Une meilleure route doit pouvoir le rouvrir.
+		if (ex != null && ex.g <= ng + 1e-6) return;
 		GNode n = new GNode();
 		n.x = x; n.y = y; n.z = z; n.kind = kind; n.floor = floor;
 		n.g = ng; n.parent = from; n.move = mv;

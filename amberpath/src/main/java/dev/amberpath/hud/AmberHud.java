@@ -85,7 +85,9 @@ public class AmberHud implements HudElement {
 		double exZ = Mth.lerp(partial, p.zo, p.getZ());
 		double ddx = wx - exX, ddy = wy - exY, ddz = wz - exZ;
 		double dist = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
-		if (dist > 400) return;
+		// Au loin, on masque le marqueur projeté : évite un repère trompeur
+		// et garde le HUD propre pendant les longues traversées.
+		if (dist > 128) return;
 		float yaw = p.getViewYRot(partial), pitch = p.getViewXRot(partial);
 		double yr = Math.toRadians(yaw), pr = Math.toRadians(pitch);
 		double fx = -Math.sin(yr) * Math.cos(pr), fy = -Math.sin(pr), fz = Math.cos(yr) * Math.cos(pr);

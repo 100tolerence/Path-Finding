@@ -11,7 +11,7 @@ import net.minecraft.util.Mth;
 public final class AimController {
 	private float tYaw, tPitch;
 	private boolean has, smooth = true;
-	private double rate = 16, maxRate = 900; // 1/s et °/s
+	private double rate = 9.5, maxRate = 480; // accélération de rotation douce, plafonnée
 	private long lastNs = 0, lastFrameMs = 0;
 
 	public void setTarget(float yaw, float pitch, boolean smooth, double v, double turnSpeed) {
@@ -19,9 +19,10 @@ public final class AimController {
 		tPitch = Mth.clamp(pitch, -89f, 89f);
 		this.smooth = smooth;
 		has = true;
-		double ts = Math.max(0.2, turnSpeed);
-		rate = (16 + v * 60) * ts;
-		maxRate = (900 + v * 1500) * ts;
+		double ts = Mth.clamp((float) turnSpeed, 0.85f, 1.15f);
+		// Courbe progressive : plus rapide quand le joueur court, sans snap brutal.
+		rate = Mth.clamp((9.0 + Math.min(v, 1.2) * 2.2) * ts, 8.0, 12.0);
+		maxRate = Mth.clamp((420.0 + Math.min(v, 1.2) * 120.0) * ts, 380.0, 570.0);
 	}
 
 	public void clear() { has = false; lastNs = 0; }

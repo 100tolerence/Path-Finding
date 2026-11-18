@@ -120,7 +120,7 @@ public class AmberPathScreen extends Screen {
 		setW.add(addRenderableWidget(new Widgets.GlassSlider(px + 24, py + 252, PW - 48, "Chute maximale sans dégâts", 3, 20, 1, " blocs", () -> (double) cfg.maxFall, v -> { cfg.maxFall = (int) (double) v; cfg.save(); })));
 		setW.add(addRenderableWidget(new Widgets.GlassSlider(px + 24, py + 280, PW - 48, "Cœurs gardés après chute risquée", 0.5, 5, 0.5, " ♥", () -> cfg.keepHearts, v -> { cfg.keepHearts = v; cfg.save(); })));
 		setW.add(addRenderableWidget(new Widgets.GlassSlider(px + 24, py + 308, PW - 48, "Écart parkour de base (adaptatif au-delà)", 1, 8, 1, " blocs", () -> (double) cfg.maxGap, v -> { cfg.maxGap = (int) (double) v; cfg.save(); })));
-		setW.add(addRenderableWidget(new Widgets.GlassSlider(px + 24, py + 336, PW - 48, "Recherche : optimale ↔ rapide", 1.0, 1.6, 0.05, "", () -> cfg.weight, v -> { cfg.weight = v; cfg.save(); })));
+
 
 		// --- Onglet Touches ---
 		Widgets.KeyBindButton openBind = new Widgets.KeyBindButton(px + 300, py + 80, 156, 24,

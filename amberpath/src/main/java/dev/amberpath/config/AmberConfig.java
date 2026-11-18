@@ -30,11 +30,11 @@ public class AmberConfig {
 	public boolean flyAuto = true;    // mode vol créatif automatique
 
 	// Recherche
-	public double weight = 1.6;       // 1.0 = optimal, 2.0+ = tres rapide
-	public int maxNodes = 160000;
-	public int budgetMs = 12;         // temps de calcul par tick
-	public int partialAfterMs = 500;  // apres ce delai, on demarre sur un chemin partiel (0 = desactive)
-	public double turnSpeed = 1.0;    // vitesse de rotation de la camera (1 = defaut)
+	public double weight = 1.0;       // verrouillé : A* non pondéré, chemin au coût estimé minimal
+	public int maxNodes = 500000;
+	public int budgetMs = 8;         // temps de calcul par tick
+	public int partialAfterMs = 60;   // premier segment rapide, puis calcul incrémental pendant le déplacement
+	public double turnSpeed = 1.0; // conservé pour compatibilité des anciens fichiers, non configurable    // vitesse de rotation de la camera (1 = defaut)
 	public int cfgVersion = 0;
 	public boolean autoReplan = true;
 	public int nearRadius = 3;
@@ -90,6 +90,7 @@ public class AmberConfig {
 				AmberConfig c = GSON.fromJson(Files.readString(p), AmberConfig.class);
 				if (c != null) {
 					if (c.presets == null) c.presets = new ArrayList<>();
+				c.enforceNavigationPolicy();
 					if (c.cfgVersion < 1) { // migration : nouveaux defauts de performance
 						if (c.weight < 1.5) c.weight = 1.6;
 						if (c.budgetMs < 12) c.budgetMs = 12;
@@ -101,10 +102,23 @@ public class AmberConfig {
 				}
 			}
 		} catch (Exception ignored) {}
-		return new AmberConfig();
+		AmberConfig defaults = new AmberConfig();
+		defaults.enforceNavigationPolicy();
+		return defaults;
+	}
+
+	/** Paramètres de navigation verrouillés : le menu ne peut pas dégrader le calcul. */
+	public void enforceNavigationPolicy() {
+		weight = 1.0; maxNodes = 500000; budgetMs = 8; partialAfterMs = 60;
+		sprint = true; parkour = true; maxGap = 3; diagonals = true; swim = true; climb = true; doors = true;
+		descend = true; adaptiveParkour = true; iceParkour = true; sneakMagma = true; avoidDanger = true;
+		flyAuto = true; smoothPath = true; smoothRotation = true; autoReplan = true;
+		// Les chutes dommageables restent interdites : priorité à un trajet rapide mais sûr.
+		riskyFalls = false;
 	}
 
 	public void save() {
+		enforceNavigationPolicy();
 		try {
 			Path p = file();
 			Files.createDirectories(p.getParent());
