@@ -1,0 +1,15 @@
+pluginManagement {
+	repositories {
+		maven {
+			name = 'Fabric'
+			url = 'https://maven.fabricmc.net/'
+		}
+		// Miroirs Maven Central (repo.maven.apache.org est limité en débit ici)
+		maven { url = 'https://maven-central.storage-download.googleapis.com/maven2/' }
+		maven { url = 'https://maven.aliyun.com/repository/public' }
+		mavenCentral()
+		gradlePluginPortal()
+	}
+}
+
+rootProject.name = 'amberpath'

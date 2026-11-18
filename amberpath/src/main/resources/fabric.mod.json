@@ -1,0 +1,25 @@
+{
+	"schemaVersion": 1,
+	"id": "amberpath",
+	"version": "${version}",
+	"name": "AmberPath",
+	"description": "Navigation automatique intelligente pilotée par commande : /go set <x> [y] <z> enregistre une cible, /go lance le trajet (sprint, parkour calibré sur l'élan, double jump conditionnel, nage, échelles, chutes sécurisées…), /go stop arrête tout et efface la cible. Aucun menu, aucun HUD : uniquement du texte en chat.",
+	"authors": [
+		"AmberPath"
+	],
+	"contact": {},
+	"license": "MIT",
+	"icon": "assets/amberpath/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"dev.amberpath.AmberPathClient"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.20.0",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}
