@@ -3,7 +3,7 @@
 	"id": "amberpath",
 	"version": "${version}",
 	"name": "AmberPath",
-	"description": "Navigation automatique intelligente : entrez des coordonnées, AmberPath calcule le meilleur chemin (sprint, parkour, nage, échelles, chutes sécurisées…) et vous y emmène. Interface liquid glass ambrée, touche activable et personnalisable.",
+	"description": "Navigation automatique intelligente pilotée par commande : /go <x> [y] <z> calcule le meilleur chemin (sprint, parkour calibré sur l'élan, double jump conditionnel, nage, échelles, chutes sécurisées…) et vous y emmène. Reprise de main manuelle = arrêt. HUD verre ambré, caméra réaliste.",
 	"authors": [
 		"AmberPath"
 	],

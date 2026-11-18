@@ -33,6 +33,7 @@ public class PathEngine {
 	public static class Move {
 		public int type; public double cost; public int gap; public boolean sprint; public boolean door;
 		public boolean waterRun; // course sur l'eau (Skyblock haute vitesse)
+		public boolean doubleJump; // 2e impulsion en l'air (uniquement si effets/vitesse le permettent)
 		public double drop; // hauteur de chute (DESCEND) pour garde santé live
 		Move(int type, double cost) { this.type = type; this.cost = cost; }
 	}
@@ -52,6 +53,7 @@ public class PathEngine {
 
 	private static class GNode {
 		int x, y, z, kind; double floor, g, h, f; GNode parent; Move move; boolean closed;
+		int run; // longueur d'élan sprint consécutif (0 = départ arrêté) → portée de saut réaliste
 		long key() { return BlockPos.asLong(x, y, z); }
 		double f(double w) { return g + w * h; }
 	}
@@ -194,12 +196,45 @@ public class PathEngine {
 		GNode n = new GNode();
 		n.x = x; n.y = y; n.z = z; n.kind = kind; n.floor = floor;
 		n.g = ng; n.parent = from; n.move = mv;
+		// Élan : seule une marche sprintée continue entretient la vitesse de décollage.
+		n.run = (mv.type == WALK && mv.sprint) ? Math.min(6, from.run + 1) : 0;
 		n.h = heuristic(n); n.f = n.g + w * n.h;
 		all.put(key, n); open.add(n);
 	}
 
 	private int gapFlat() { return cfg.adaptiveParkour ? Math.max(cfg.maxGap, ph.maxGapFlat) : cfg.maxGap; }
 	private int gapDown() { return cfg.adaptiveParkour ? Math.max(cfg.maxGap + 1, ph.maxGapDown) : cfg.maxGap + 1; }
+
+	/**
+	 * Vitesse de décollage réaliste selon l'élan accumulé : un saut départ arrêté
+	 * porte nettement moins loin qu'un saut après 3+ blocs de sprint. C'est la cause
+	 * des « sauts trop grands » : on ne propose plus que des écarts réellement franchissables.
+	 */
+	private double takeoffVel(GNode n, double iceF) {
+		double mom = n.run >= 3 ? 1.0 : 0.62 + 0.13 * n.run;
+		return ph.sprintVel * mom * iceF;
+	}
+
+	/** Cellule cul-de-sac ? (0 sortie = piège, 1 sortie = fond de poche → pénalité). */
+	private int exitCount(int x, int y, int z) {
+		int c = 0;
+		if (m.kind(x + 1, y, z) != WorldModel.INVALID) c++;
+		if (m.kind(x - 1, y, z) != WorldModel.INVALID) c++;
+		if (m.kind(x, y, z + 1) != WorldModel.INVALID) c++;
+		if (m.kind(x, y, z - 1) != WorldModel.INVALID) c++;
+		return c;
+	}
+
+	private boolean goalCell(int x, int y, int z, double floor) {
+		switch (goal.mode) {
+			case 0: return x == goal.x && z == goal.z && (goal.y == null || Math.abs(floor - (goal.y + 1)) < 0.75);
+			case 1: return x == goal.x && z == goal.z && (goal.y == null || y == goal.y);
+			default:
+				double dx = x - goal.x, dz = z - goal.z;
+				return dx * dx + dz * dz <= (double) goal.radius * goal.radius
+						&& (goal.y == null || Math.abs(y - goal.y) <= goal.radius);
+		}
+	}
 
 	private void expand(GNode n) {
 		if (n.kind == WorldModel.FLY) { expandFly(n); return; }
@@ -302,8 +337,12 @@ public class PathEngine {
 				// GROUND
 				double df = f1 - f0;
 				if (ty == n.y && Math.abs(df) <= stepTol) {
+					// Analyse d'environnement : ne pas s'engager dans une poche sans issue.
+					int exits = exitCount(nx, ty, nz);
+					if (exits == 0 && !goalCell(nx, ty, nz, f1)) continue;
 					double slow = m.surfaceFactor(nx, ty, nz) * m.surfaceFactor(n.x, n.y, n.z);
 					double cost = walkBase * dirF * Math.max(1, slow) + m.cellExtra(nx, ty, nz);
+					if (exits == 1 && !goalCell(nx, ty, nz, f1)) cost += 6; // fond de couloir : découragé
 					Move mv = new Move(WALK, cost);
 					mv.sprint = sprintOk; mv.door = m.doorClosed(nx, ty, nz);
 					offer(n, mv, nx, ty, nz, k, f1);
@@ -333,13 +372,20 @@ public class PathEngine {
 			if (iceBelow && !cfg.iceParkour) continue;
 			if (!m.passable(n.x, n.y + 2, n.z)) continue;
 			double iceF = iceBelow ? 1.2 : 1.0;
+			// Portée RÉELLE : vitesse de décollage selon l'élan + marge de sécurité (0.45 bloc).
+			// Fini les sauts « trop grands » proposés depuis un départ arrêté ou après un virage.
+			double vT = takeoffVel(n, iceF);
 			int gFlat = (int) (gapFlat() * iceF);
 			int gDown = (int) (gapDown() * iceF);
+			int reachFlat = (int) Math.floor(vT * ph.airTimeFlat - 0.45);
+			int reachDown = (int) Math.floor(vT * ph.airTimeDown1 - 0.45);
+			int maxFlat = Math.min(gFlat + 1, reachFlat);
+			int maxDown = Math.min(gDown + 1, reachDown);
 
 			// Saut plat / descendant au-dessus du vide (inutile si la case voisine se marche)
 			if (!nextWalk) {
 				for (int dy = 0; dy >= -1; dy--) {
-					int maxD = (dy == 0 ? gFlat : gDown) + 1;
+					int maxD = dy == 0 ? maxFlat : maxDown;
 					for (int D = 2; D <= maxD; D++) {
 						int tx = n.x + dx * D, tz = n.z + dz * D;
 						int k = m.kind(tx, n.y + dy, tz);
@@ -354,13 +400,32 @@ public class PathEngine {
 						offer(n, mv, tx, n.y + dy, tz, k, f1);
 					}
 				}
+				// Double jump : UNIQUEMENT si effets/vitesse le permettent, et seulement
+				// pour les écarts hors de portée d'un saut simple. Échec → blacklist immédiate.
+				if (ph.canDoubleJump && dy0Allowed(n)) {
+					int reachDj = (int) Math.floor(vT * ph.airTimeDouble - 0.45);
+					int maxDj = Math.min(reachDj, gFlat + 5);
+					int topDj = Math.min(10, (int) Math.ceil(ph.jumpPeakDouble) + 1);
+					for (int D = Math.max(2, maxFlat + 1); D <= maxDj; D++) {
+						int tx = n.x + dx * D, tz = n.z + dz * D;
+						int k = m.kind(tx, n.y, tz);
+						if (k != WorldModel.GROUND) continue;
+						double f1 = m.floorOf(k, tx, n.y, tz);
+						if (Math.abs(f1 - f0) > 0.6) continue;
+						if (!clearPath(n, dx, dz, D, topDj)) continue;
+						Move mv = new Move(PARKOUR, D * ph.sprintJumpCost + 5 + 2 + 6);
+						mv.gap = D; mv.sprint = true; mv.doubleJump = true;
+						offer(n, mv, tx, n.y, tz, k, f1);
+					}
+				}
 			}
-			// Saut montant (+1..+maxAscend) avec élan
+			// Saut montant (+1..+maxAscend) avec élan — portée réduite (arc plus court).
 			int maxUp = ph.maxAscend;
+			int maxDUp = Math.min(gFlat + 1, (int) Math.floor(vT * ph.airTimeFlat * 0.62 - 0.45));
 			for (int R = 1; R <= maxUp; R++) {
 				if (R >= 2 && ph.jumpPeak < R + 0.3) continue;
 				int minD = 2;
-				int maxD = gFlat + 1;
+				int maxD = maxDUp;
 				for (int D = minD; D <= maxD; D++) {
 					int tx = n.x + dx * D, tz = n.z + dz * D;
 					int k = m.kind(tx, n.y + R, tz);
@@ -375,6 +440,11 @@ public class PathEngine {
 				}
 			}
 		}
+	}
+
+	/** Le double jump n'a de sens que depuis un sol ferme (pas d'eau/miel sous les pieds). */
+	private boolean dy0Allowed(GNode n) {
+		return n.kind == WorldModel.GROUND && !m.honey(n.x, n.y - 1, n.z);
 	}
 
 	/** Course sur l'eau : horizontal uniquement, sprint forcé, pas de saut (on est dans l'eau). */

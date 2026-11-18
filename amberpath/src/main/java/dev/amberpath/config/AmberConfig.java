@@ -6,10 +6,12 @@ import net.minecraft.client.Minecraft;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
 
-/** Tous les paramètres de navigation, persistés dans config/amberpath.json. */
+/**
+ * Paramètres de navigation persistés dans config/amberpath.json.
+ * Depuis la v2 : UNIQUEMENT la commande /go (aucun menu, aucune touche, aucun preset).
+ * Les anciens fichiers sont migrés automatiquement (les champs GUI sont ignorés).
+ */
 public class AmberConfig {
 	// Mouvement
 	public boolean sprint = true;
@@ -23,7 +25,8 @@ public class AmberConfig {
 	public int maxFall = 3;           // chute sans dégâts maximale (blocs)
 	public boolean riskyFalls = true; // autoriser les chutes avec dégâts (bornées par la santé)
 	public double keepHearts = 1.0;   // cœurs minimum conservés après une chute risquée
-	public boolean adaptiveParkour = true; // portée des sauts adaptée à Speed / Jump Boost
+	public boolean adaptiveParkour = true; // portée des sauts adaptée à Speed / Jump Boost / élan
+	public boolean doubleJump = true; // 2e impulsion en l'air SI effets/vitesse le permettent (sinon jamais)
 	public boolean iceParkour = true; // autoriser les sauts depuis la glace
 	public boolean sneakMagma = true;
 	public boolean avoidDanger = true;// lave, feu, cactus, wither rose, poudreuse
@@ -32,20 +35,18 @@ public class AmberConfig {
 	// Recherche
 	public double weight = 1.0;       // verrouillé : A* non pondéré, chemin au coût estimé minimal
 	public int maxNodes = 500000;
-	public int budgetMs = 8;         // temps de calcul par tick
+	public int budgetMs = 8;          // temps de calcul par tick
 	public int partialAfterMs = 60;   // premier segment rapide, puis calcul incrémental pendant le déplacement
-	public double turnSpeed = 1.0; // conservé pour compatibilité des anciens fichiers, non configurable    // vitesse de rotation de la camera (1 = defaut)
 	public int cfgVersion = 0;
 	public boolean autoReplan = true;
-	public int nearRadius = 3;
 	public boolean smoothPath = true; // lissage « string-pulling » des longs segments
 
 	// Confort / sécurité
-	public boolean pauseInMenus = true;
 	public boolean pauseOnDamage = false; // les dégâts (chutes, mobs) n'interrompent pas le chemin
 	public boolean showHud = true;
 	public boolean showPath = true;
 	public boolean smoothRotation = true;
+	// Note : l'arrêt sur interférence manuelle (écran, clavier, souris) est TOUJOURS actif.
 
 	// --- Hypixel Skyblock ---
 	public boolean skyblockAuto = true;   // détection automatique de Hypixel Skyblock
@@ -60,24 +61,6 @@ public class AmberConfig {
 	public boolean voidGuard = true;      // aucune chute / aucun saut sans atterrissage confirmé
 	public int maxFallScan = 48;          // profondeur max de recherche d'atterrissage (blocs)
 
-	// Objectif
-	public int goalMode = 0;          // 0 = se tenir dessus, 1 = atteindre, 2 = approcher
-	public String lastX = "";
-	public String lastY = "";
-	public String lastZ = "";
-
-	// Points de repère enregistrés (îles, hub, jardin…))
-	public List<Preset> presets = new ArrayList<>();
-
-	public static class Preset {
-		public String name;
-		public int x;
-		public Integer y;
-		public int z;
-		public Preset() {}
-		public Preset(String name, int x, Integer y, int z) { this.name = name; this.x = x; this.y = y; this.z = z; }
-	}
-
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 	private static Path file() {
 		return Minecraft.getInstance().gameDirectory.toPath().resolve("config").resolve("amberpath.json");
@@ -89,13 +72,10 @@ public class AmberConfig {
 			if (Files.exists(p)) {
 				AmberConfig c = GSON.fromJson(Files.readString(p), AmberConfig.class);
 				if (c != null) {
-					if (c.presets == null) c.presets = new ArrayList<>();
-				c.enforceNavigationPolicy();
-					if (c.cfgVersion < 1) { // migration : nouveaux defauts de performance
-						if (c.weight < 1.5) c.weight = 1.6;
-						if (c.budgetMs < 12) c.budgetMs = 12;
-						if (c.maxFallScan > 48) c.maxFallScan = 48;
-						c.cfgVersion = 1;
+					c.enforceNavigationPolicy();
+					if (c.cfgVersion < 2) { // migration v2 : /go uniquement, double jump conditionnel
+						c.doubleJump = true;
+						c.cfgVersion = 2;
 						c.save();
 					}
 					return c;
@@ -107,7 +87,7 @@ public class AmberConfig {
 		return defaults;
 	}
 
-	/** Paramètres de navigation verrouillés : le menu ne peut pas dégrader le calcul. */
+	/** Paramètres de navigation verrouillés : aucun ancien fichier ne peut dégrader le calcul. */
 	public void enforceNavigationPolicy() {
 		weight = 1.0; maxNodes = 500000; budgetMs = 8; partialAfterMs = 60;
 		sprint = true; parkour = true; maxGap = 3; diagonals = true; swim = true; climb = true; doors = true;

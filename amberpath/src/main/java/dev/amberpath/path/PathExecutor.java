@@ -19,11 +19,19 @@ import net.minecraft.world.phys.Vec3;
  * immédiate du chemin après atterrissage) et au recul : « saute » les nœuds déjà
  * dépassés au lieu de perdre le chemin. Ignore les mobs.
  *
+ * Réactivité : collision ou absence de progrès détectées en < 0.5 s ; un saut manqué
+ * est détecté EN VOL (sous le niveau d'atterrissage sans espoir de portée) et déclenche
+ * un recalcul immédiat + blacklist du nœud. Avant tout décollage, la zone d'atterrissage
+ * et le couloir de saut sont re-validés dans le monde live (blocs posés/cassés).
+ *
+ * Double jump : 2e impulsion au sommet de l'arc, uniquement pour les mouvements marqués
+ * doubleJump (le moteur ne les propose que si effets/vitesse le permettent).
+ *
  * Skyblock : course sur l'eau (sprint forcé, jamais de sneak, coup de saut si on
  * s'enfonce), auto-step assisté d'un saut client si le serveur tarde à monter.
  */
 public class PathExecutor {
-	public enum Signal { NONE, PATH_END, STUCK, BLOCKED, FALL_UNSAFE }
+	public enum Signal { NONE, PATH_END, STUCK, BLOCKED, FALL_UNSAFE, JUMP_FAILED }
 
 	private final Minecraft mc;
 	private final AmberConfig cfg;
@@ -32,9 +40,13 @@ public class PathExecutor {
 	public int idx = 1;
 	public boolean stuckByCollision = false;
 	public final AimController aim = new AimController();
-	private int stuckTicks = 0, collisionTicks = 0, doorCooldown = 0, validateTimer = 0;
+	private int stuckTicks = 0, collisionTicks = 0, doorCooldown = 0, validateTimer = 0, moveTicks = 0;
 	private double bestDist = Double.MAX_VALUE;
 	private boolean wasAirborne = false;
+	private boolean djDone = false;   // 2e impulsion déjà tentée sur ce saut
+	private int djHold = 0;           // maintient la touche saut 2 ticks pour l'impulsion
+	// Dernier état de touches SIMULÉ par nous — toute déviation = entrée manuelle du joueur.
+	private boolean kF, kJ, kSn, kSp;
 
 	public PathExecutor(Minecraft mc, AmberConfig cfg, WorldModel model, PathEngine.PathResult path) {
 		this.mc = mc; this.cfg = cfg; this.model = model; this.path = path;
@@ -45,14 +57,25 @@ public class PathExecutor {
 		return idx - 1 >= 0 && idx - 1 < path.moves.size() && path.moves.get(idx - 1).waterRun;
 	}
 
+	/** Vrai si le joueur a touché au clavier de déplacement (état différent de notre simulation). */
+	public boolean manualInput() {
+		var o = mc.options;
+		return o.keyUp.isDown() != kF || o.keyDown.isDown() || o.keyLeft.isDown() || o.keyRight.isDown()
+				|| o.keyJump.isDown() != kJ || o.keyShift.isDown() != kSn || o.keySprint.isDown() != kSp;
+	}
+
 	public void release() {
 		aim.clear();
 		var o = mc.options;
 		o.keyUp.setDown(false); o.keyDown.setDown(false); o.keyLeft.setDown(false);
 		o.keyRight.setDown(false); o.keyJump.setDown(false); o.keyShift.setDown(false); o.keySprint.setDown(false);
+		kF = kJ = kSn = kSp = false;
+		djHold = 0;
 	}
 
 	private double speed(LocalPlayer p) { return p.getDeltaMovement().horizontalDistance(); }
+
+	private void advanceReset() { stuckTicks = 0; bestDist = Double.MAX_VALUE; moveTicks = 0; djDone = false; djHold = 0; }
 
 	/** Avance idx au-delà des nœuds atteints ou dépassés (anti-dépassement haute vitesse / chute). */
 	private void skipAhead(LocalPlayer p) {
@@ -88,7 +111,7 @@ public class PathExecutor {
 			}
 			break;
 		}
-		if (j > idx) { idx = j; stuckTicks = 0; bestDist = Double.MAX_VALUE; }
+		if (j > idx) { idx = j; advanceReset(); }
 	}
 
 	/** Après une chute : retrouve le premier nœud du chemin proche de la position réelle. */
@@ -105,6 +128,27 @@ public class PathExecutor {
 		return -1;
 	}
 
+	/**
+	 * Re-validation LIVE avant décollage : l'atterrissage existe-t-il toujours et le
+	 * couloir de saut est-il libre ? Évite de sauter vers un bloc cassé/posé entre-temps
+	 * (cause classique de « j'y vais, je finis bloqué, je recalcule »).
+	 */
+	private boolean jumpStillValid(BlockPos t, double tf, PathEngine.Move mv) {
+		int k = model.kind(t.getX(), t.getY(), t.getZ());
+		if (k != WorldModel.GROUND && k != WorldModel.SURFACE) return false;
+		double f = model.floorOf(k, t.getX(), t.getY(), t.getZ());
+		if (Double.isNaN(f) || Math.abs(f - tf) > 0.3) return false;
+		if (mv.type == PathEngine.PARKOUR && mv.gap >= 2 && idx - 1 >= 0) {
+			BlockPos s = path.nodes.get(idx - 1);
+			int sx = Integer.signum(t.getX() - s.getX()), sz = Integer.signum(t.getZ() - s.getZ());
+			for (int c = 1; c < mv.gap; c++) {
+				int cx = s.getX() + sx * c, cz = s.getZ() + sz * c;
+				if (!model.passable(cx, s.getY() + 1, cz) || !model.passable(cx, s.getY() + 2, cz)) return false;
+			}
+		}
+		return true;
+	}
+
 	public Signal tick() {
 		LocalPlayer p = mc.player;
 		if (p == null) return Signal.NONE;
@@ -112,11 +156,12 @@ public class PathExecutor {
 
 		skipAhead(p);
 		if (idx >= path.nodes.size()) { release(); return Signal.PATH_END; }
+		moveTicks++;
 
-		// Validation périodique (blocs posés/cassés, portes, lave si Résistance au feu perdue)
-		if (++validateTimer >= 8) {
+		// Validation périodique rapprochée (blocs posés/cassés, portes, lave si Résistance au feu perdue)
+		if (++validateTimer >= 4) {
 			validateTimer = 0;
-			for (int j = idx; j < Math.min(idx + 4, path.nodes.size()); j++) {
+			for (int j = idx; j < Math.min(idx + 6, path.nodes.size()); j++) {
 				BlockPos n = path.nodes.get(j);
 				if (model.kind(n.getX(), n.getY(), n.getZ()) == WorldModel.INVALID) { release(); return Signal.BLOCKED; }
 			}
@@ -141,30 +186,43 @@ public class PathExecutor {
 		boolean advanced = (tk == WorldModel.GROUND || tk == WorldModel.SURFACE)
 				? dist2 < Math.max(0.42, v * 0.85) && Math.abs(feet.y - tf) < Math.max(0.75, v * 0.5 + 0.3)
 				: dist3 < Math.max(0.65, v * 0.85);
-		if (advanced) { idx++; stuckTicks = 0; bestDist = Double.MAX_VALUE; return Signal.NONE; }
+		if (advanced) { idx++; advanceReset(); return Signal.NONE; }
 
 		boolean onGround = p.onGround();
 		boolean inWater = p.isInWater();
+
+		// --- Saut manqué : réaction IMMÉDIATE en vol (sous le niveau d'atterrissage, hors de portée) ---
+		if (mv.type == PathEngine.PARKOUR && !onGround && p.getDeltaMovement().y < 0
+				&& feet.y < tf - 0.35 && dist2 > 1.0) {
+			release();
+			return Signal.JUMP_FAILED;
+		}
+		// --- Décollage impossible (pas d'élan / bord bloqué) : on n'insiste pas 3 secondes ---
+		if ((mv.type == PathEngine.PARKOUR || mv.type == PathEngine.ASCEND) && onGround && moveTicks > 30) {
+			release();
+			return Signal.STUCK;
+		}
 
 		// --- Garde anti-void / récupération de chute ---
 		if (!onGround && p.getDeltaMovement().y < -0.02) {
 			if (feet.y < mc.level.getMinY() + 1) { release(); return Signal.STUCK; }
 			if (feet.y < tf - 3.0) {
 				int rec = recoverAfterFall(feet);
-				if (rec > 0) { idx = rec; stuckTicks = 0; bestDist = Double.MAX_VALUE; release(); return Signal.NONE; }
+				if (rec > 0) { idx = rec; advanceReset(); release(); return Signal.NONE; }
 				if (feet.y < tf - 6.0) { release(); return Signal.STUCK; } // replanification immédiate
 			}
 		}
 		if (wasAirborne && onGround) {
 			int rec = recoverAfterFall(feet);
 			if (rec > idx) idx = rec;
-			stuckTicks = 0; bestDist = Double.MAX_VALUE;
+			advanceReset();
 		}
 		wasAirborne = !onGround;
 
 		// Porte / portillon à ouvrir
 		if (mv.door && model.doorClosed(t.getX(), t.getY(), t.getZ())) {
 			if (dist3 <= 2.6) {
+				aim.setPrecise(true);
 				aim(p, tx, t.getY() + 0.5, tz, true);
 				if (--doorCooldown <= 0) {
 					doorCooldown = 8;
@@ -196,9 +254,12 @@ public class PathExecutor {
 		}
 		float desiredYaw = (float) Math.toDegrees(Math.atan2(-(aimX - feet.x), aimZ - feet.z));
 		boolean verticalAim = tk == WorldModel.WATER || tk == WorldModel.LAVA || tk == WorldModel.CLIMB || tk == WorldModel.FLY || mv.type == PathEngine.CLIMB_UP;
+		// Pitch géométrique vers le sol cible (le léger « regard vers le bas » naturel
+		// et les micro-mouvements sont ajoutés par AimController, pas en boucle ici).
 		float desiredPitch = verticalAim
 				? Mth.clamp((float) -Math.toDegrees(Math.atan2(dy + (tk == WorldModel.CLIMB ? 0.4 : 0), Math.max(0.3, dist2))), -80, 80)
-				: (mv.type == PathEngine.CLIMB_DOWN ? 70f : p.getXRot());
+				: (mv.type == PathEngine.CLIMB_DOWN ? 70f : Mth.clamp((float) -Math.toDegrees(Math.atan2(dy, Math.max(0.3, dist2))), -20f, 35f));
+		aim.setPrecise(mv.type == PathEngine.PARKOUR || mv.door);
 		aim(p, desiredYaw, desiredPitch, true, v);
 		float err = Math.abs(Mth.wrapDegrees(desiredYaw - p.getYRot()));
 		boolean aligned = err < (mv.type == PathEngine.PARKOUR ? 16 : 50);
@@ -219,13 +280,23 @@ public class PathExecutor {
 				if (onGround && aligned && p.isSprinting()
 						&& dist2 <= mv.gap + 0.6 + v * 1.2
 						&& dist2 >= mv.gap - 0.6 - v * 0.5) {
+					if (!jumpStillValid(t, tf, mv)) { release(); return Signal.BLOCKED; }
 					jump = true;
 				}
-				if (!onGround) { forward = true; sprint = cfg.sprint; } // garde l'élan en l'air
+				if (!onGround) {
+					forward = true; sprint = cfg.sprint; // garde l'élan en l'air
+					// Double jump : 2e impulsion au sommet de l'arc (mv marqué par le moteur
+					// uniquement si effets/vitesse le permettent). Maintenue 2 ticks.
+					if (mv.doubleJump && !djDone && p.getDeltaMovement().y <= 0.0) { djDone = true; djHold = 2; }
+					if (djHold > 0) { jump = true; djHold--; }
+				}
 			}
 			case PathEngine.ASCEND -> {
 				sprint = aligned && cfg.sprint && mv.sprint;
-				if (onGround && aligned && dist2 < 1.2 + v && dist2 > 0.2) jump = true;
+				if (onGround && aligned && dist2 < 1.2 + v && dist2 > 0.2) {
+					if (!jumpStillValid(t, tf, mv)) { release(); return Signal.BLOCKED; }
+					jump = true;
+				}
 			}
 			case PathEngine.DESCEND -> {
 				// Garde santé live avant une chute risquée
@@ -272,12 +343,13 @@ public class PathExecutor {
 
 		setKeys(forward, jump, sneak, sprint);
 
-		// Anti-blocage
+		// Anti-blocage RAPIDE : collision franche → 0.4 s ; plus aucun progrès → 1 s.
 		double d = tk == WorldModel.GROUND || tk == WorldModel.SURFACE ? dist2 : dist3;
 		if (d < bestDist - 0.04) { bestDist = d; stuckTicks = 0; } else stuckTicks++;
 		if (p.horizontalCollision && forward) collisionTicks++; else collisionTicks = 0;
-		stuckByCollision = collisionTicks > 20;
-		if (stuckTicks > 60 || collisionTicks > 35) { release(); return Signal.STUCK; }
+		stuckByCollision = collisionTicks > 6;
+		if (collisionTicks > 8) { release(); return Signal.BLOCKED; }
+		if (stuckTicks > 20) { release(); return Signal.STUCK; }
 		return Signal.NONE;
 	}
 
@@ -300,6 +372,7 @@ public class PathExecutor {
 		o.keyJump.setDown(jump);
 		o.keyShift.setDown(sneak);
 		o.keySprint.setDown(sprint);
+		kF = forward; kJ = jump; kSn = sneak; kSp = sprint;
 	}
 
 	public double remainingDistance() {

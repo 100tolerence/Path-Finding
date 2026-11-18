@@ -16,9 +16,6 @@ import net.minecraft.world.item.enchantment.Enchantment;
 import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.item.enchantment.Enchantments;
 
-import java.util.ArrayList;
-import java.util.List;
-
 /**
  * Profil physique LIVE du joueur : lit les attributs réels (vitesse, saut, gravité,
  * hauteur de pas, chute sûre, multiplicateur de dégâts de chute, efficacité aquatique,
@@ -63,9 +60,14 @@ public final class PlayerPhysics {
 	public final double jumpPeak;                             // hauteur max du saut (blocs)
 	public final double airTimeFlat, airTimeDown1;            // ticks en l'air (plat / -1)
 	public final double sprintJumpDist, walkJumpDist;         // portée horizontale sprint-saut / saut simple
+	public final double sprintVel, walkVel;                   // vitesse horizontale de décollage (blocs/tick)
 	public final int maxGapFlat, maxGapDown, maxAscend;       // écart max plat / descendant, montée max
 	public final double sneakFactor;                          // vitesse accroupi (0.3 normal)
 	public final double fallMult;                             // multiplicateur dégâts de chute (EPF)
+
+	// --- Double jump (conditionnel : effets / vitesse uniquement) ---
+	public final boolean canDoubleJump;                       // capacité estimée serveur (Jump Boost / ✦ Speed)
+	public final double airTimeDouble, jumpPeakDouble;        // temps en l'air / pic avec 2e impulsion au sommet
 
 	// --- Coûts calibrés (ticks / bloc) ---
 	public final double walkCost, sprintCost, sprintJumpCost, swimCost, lavaCost, flyCost;
@@ -131,12 +133,24 @@ public final class PlayerPhysics {
 		// Portée horizontale calibrée : sprint-saut de base ≈ 4.2 blocs (écart 3).
 		double vSprint = 0.36 * effSpeed;
 		double vWalk = 0.17 * effSpeed;
+		this.sprintVel = vSprint;
+		this.walkVel = vWalk;
 		this.sprintJumpDist = vSprint * airTimeFlat;
 		this.walkJumpDist = vWalk * airTimeFlat;
 		int cap = 24; // borne de recherche (évite l'explosion combinatoire à Speed 255)
 		this.maxGapFlat = clampInt((int) Math.floor(sprintJumpDist - 0.25) - 1, 1, cap);
 		this.maxGapDown = clampInt((int) Math.floor(vSprint * airTimeDown1 - 0.25) - 1, 1, cap + 4);
 		this.maxAscend = clampInt((int) Math.floor(jumpPeak - 0.05), 1, 8);
+
+		// Double jump : envisagé UNIQUEMENT si les effets / la vitesse le permettent
+		// (Jump Boost II+, ou Jump Boost I + grande vitesse, ou ✦ Speed Skyblock ≥ 250).
+		// Sans ces conditions, aucun double saut n'est proposé. Si le serveur ne le
+		// gère pas, l'échec est détecté en vol et le nœud est blacklisté immédiatement.
+		this.canDoubleJump = cfg.doubleJump && !slowFalling && !levitation
+				&& (jumpAmp >= 2 || (jumpAmp >= 1 && effSpeed >= 1.5) || (sbActive && sbSpeedStat >= 250));
+		double[] dj = simulateDoubleJump(jumpStrength, g);
+		this.jumpPeakDouble = dj[0];
+		this.airTimeDouble = dj[1];
 
 		this.sneakFactor = Math.max(0.1, Math.min(1.0, sneakSpeedAttr));
 
@@ -202,6 +216,22 @@ public final class PlayerPhysics {
 		return d <= 1e-9 ? 1 : Math.max(0, Math.min(1, a / d));
 	}
 
+	/** {pic, tempsPlat} — 2e impulsion (vy remis à jumpStrength) au sommet de la 1re arche. */
+	private static double[] simulateDoubleJump(double v0, double g) {
+		double y = 0, vy = v0, peak = 0, prevY = 0;
+		boolean second = false;
+		for (int t = 1; t <= 600; t++) {
+			prevY = y;
+			y += vy;
+			if (y > peak) peak = y;
+			if (!second && vy <= 0) { vy = v0; second = true; } // re-saut au sommet
+			else if (second && y <= 0 && vy < 0) return new double[]{peak, t - 1 + frac(prevY, y)};
+			vy = (vy - g) * 0.98;
+			if (y < -80) break;
+		}
+		return new double[]{peak, 18};
+	}
+
 	/** Dégâts de chute bruts (hors modificateur d'atterrissage) pour une hauteur donnée. */
 	public double fallDamage(double drop) {
 		if (slowFalling || creative || spectator || fallDamageMult <= 0) return 0;
@@ -227,35 +257,4 @@ public final class PlayerPhysics {
 		return 1.0;
 	}
 
-	/** Pastilles d'effets/enchantements détectés pour l'interface. */
-	public List<String> chips() {
-		List<String> l = new ArrayList<>();
-		if (sbSpeedStat > 0) l.add("✦ Speed " + sbSpeedStat);
-		if (sbAutoStep) l.add("Auto-step ✓");
-		if (sbWaterWalk) l.add("Course sur l'eau ✓");
-		if (speedAmp > 0) l.add("Speed " + roman(speedAmp));
-		if (slownessAmp > 0) l.add("Slowness " + roman(slownessAmp));
-		if (jumpAmp > 0) l.add("Jump Boost " + roman(jumpAmp));
-		if (fireResist) l.add("Fire Resistance");
-		if (slowFalling) l.add("Slow Falling");
-		if (dolphinsGrace) l.add("Dolphins Grace");
-		if (conduitPower) l.add("Conduit Power");
-		if (waterBreathing) l.add("Water Breathing");
-		if (levitation) l.add("Levitation");
-		if (depthStrider > 0) l.add("Depth Strider " + roman(depthStrider));
-		if (soulSpeed > 0) l.add("Soul Speed " + roman(soulSpeed));
-		if (featherFalling > 0) l.add("Feather Falling " + roman(featherFalling));
-		if (protection > 0) l.add("Protection " + roman(protection));
-		if (swiftSneak > 0) l.add("Swift Sneak " + roman(swiftSneak));
-		if (frostWalker > 0) l.add("Frost Walker " + roman(frostWalker));
-		if (leatherBoots) l.add("Bottes en cuir");
-		if (flying) l.add("Vol créatif");
-		if (spectator) l.add("Spectateur");
-		return l;
-	}
-
-	private static String roman(int n) {
-		return switch (n) { case 1 -> "I"; case 2 -> "II"; case 3 -> "III"; case 4 -> "IV"; case 5 -> "V";
-			case 6 -> "VI"; case 7 -> "VII"; case 8 -> "VIII"; case 9 -> "IX"; case 10 -> "X"; default -> String.valueOf(n); };
-	}
 }

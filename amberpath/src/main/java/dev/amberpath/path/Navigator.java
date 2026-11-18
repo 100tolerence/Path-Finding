@@ -1,7 +1,6 @@
 package dev.amberpath.path;
 
 import dev.amberpath.config.AmberConfig;
-import dev.amberpath.gui.AmberPathScreen;
 import dev.amberpath.skyblock.SkyblockHelper;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
@@ -10,12 +9,21 @@ import net.minecraft.gizmos.GizmoStyle;
 import net.minecraft.gizmos.Gizmos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.sounds.SoundEvents;
+import net.minecraft.util.Mth;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.HashMap;
 import java.util.Map;
 
-/** Orchestrateur : machine à états, recherche, exécution, replanification, gizmos, Skyblock. */
+/**
+ * Orchestrateur : machine à états, recherche, exécution, replanification, gizmos, Skyblock.
+ *
+ * Pilotage UNIQUEMENT par /go (aucun menu, aucune touche). Dès que le joueur reprend
+ * la main — inventaire/chat/autre écran, touches de déplacement, caméra à la souris —
+ * la navigation est arrêtée : immédiatement au sol, ou une fois le bloc courant atteint
+ * (atterrissage) si le joueur est en l'air, pour ne jamais le lâcher au-dessus du vide.
+ * L'arrivée au bloc destination arrête évidemment aussi la navigation.
+ */
 public class Navigator {
 	public enum Status { IDLE, COMPUTING, RUNNING, PAUSED, ARRIVED, FAILED }
 
@@ -45,7 +53,16 @@ public class Navigator {
 	private int refreshTimer = 0;
 	private int sbTimer = 0;
 	private long retryAt = 0;
-	private boolean manualPause = false;
+	private int activationFails = 0;
+
+	// Arrêt différé : interférence manuelle détectée en l'air → on finit le bloc courant.
+	private String pendingStop = null;
+	private int stopGrace = 0;
+	// Grâce post-/go : l'écran de chat peut encore être ouvert l'instant de l'exécution.
+	private int screenGrace = 0;
+	// Référence de caméra pendant les phases sans exécuteur (détection souris manuelle).
+	private float snapYaw, snapPitch;
+	private boolean snapValid = false;
 
 	public Navigator(AmberConfig cfg) { this.cfg = cfg; }
 
@@ -67,43 +84,62 @@ public class Navigator {
 		this.goal = g;
 		this.replans = 0;
 		this.retryAt = 0;
-		this.manualPause = false;
+		this.pendingStop = null;
+		this.activationFails = 0;
 		this.lastHealth = mc.player.getHealth();
+		if (executor != null) executor.release(); // relance /go : ne pas laisser nos touches simulées enfoncées
 		this.engine = null;
 		this.queuedPath = null;
+		this.executor = null;
 		this.status = Status.COMPUTING;
+		this.screenGrace = 3;
+		snapshotRot();
 		mc.player.playSound(SoundEvents.EXPERIENCE_ORB_PICKUP, 0.7f, 1.4f);
-		msg("Navigation vers §e" + g.x + ", " + (g.y == null ? "auto" : g.y) + ", " + g.z + "§r…");
+		msg("Navigation vers §e" + g.x + ", " + (g.y == null ? "auto" : g.y) + ", " + g.z + "§r… (§7/go stop§r pour arrêter)");
 	}
 
 	public void stop() {
 		if (executor != null) executor.release();
 		status = Status.IDLE;
 		engine = null; executor = null; path = null; queuedPath = null;
-		manualPause = false;
+		pendingStop = null;
+		snapValid = false;
 	}
 
-	public void toggle() {
-		if (active()) {
-			stop(); msg("Navigation §carrêtée§r.");
-			if (mc.player != null) mc.player.playSound(SoundEvents.UI_BUTTON_CLICK.value(), 0.6f, 0.8f);
-		} else if (goal != null) start(goal);
-		else { mc.setScreenAndShow(new AmberPathScreen()); msg("Définissez d'abord une destination (§eG§r par défaut)."); }
-	}
-
-	/** Pause / reprise manuelle (touche dédiée). */
-	public void togglePause() {
-		if (status == Status.RUNNING || status == Status.COMPUTING) {
-			manualPause = true;
-			status = Status.PAUSED;
-			pauseReason = "pause manuelle";
-			if (executor != null) executor.release();
-			msg("Navigation §een pause§r.");
-		} else if (status == Status.PAUSED && manualPause) {
-			manualPause = false;
-			status = executor != null ? Status.RUNNING : Status.COMPUTING;
-			msg("Navigation §areprise§r.");
+	/**
+	 * Reprise de main du joueur : arrêt demandé. Au sol (ou dans l'eau) → immédiat ;
+	 * en l'air → on laisse le mouvement courant se terminer sur son bloc (atterrissage),
+	 * avec un garde-fou de 3 s si le monde est en pause (inventaire en solo).
+	 */
+	private void requestStop(String reason) {
+		if (pendingStop != null || !active()) return;
+		LocalPlayer p = mc.player;
+		if (p == null || executor == null || p.onGround() || p.isInWater()) {
+			stop();
+			msg("Navigation §carrêtée§r — " + reason + ".");
+			return;
 		}
+		pendingStop = reason;
+		stopGrace = 60;
+	}
+
+	private void snapshotRot() {
+		LocalPlayer p = mc.player;
+		if (p != null) { snapYaw = p.getYRot(); snapPitch = p.getXRot(); snapValid = true; }
+	}
+
+	private boolean manualKeys() {
+		var o = mc.options;
+		return o.keyUp.isDown() || o.keyDown.isDown() || o.keyLeft.isDown() || o.keyRight.isDown()
+				|| o.keyJump.isDown() || o.keyShift.isDown() || o.keySprint.isDown();
+	}
+
+	private boolean manualLook() {
+		LocalPlayer p = mc.player;
+		if (p == null) return false;
+		if (executor != null) return executor.aim.externalLook(p);
+		if (!snapValid) return false;
+		return Math.abs(Mth.wrapDegrees(p.getYRot() - snapYaw)) > 1.5f || Math.abs(p.getXRot() - snapPitch) > 1.5f;
 	}
 
 	private BlockPos findStart() {
@@ -140,14 +176,20 @@ public class Navigator {
 		return candidate != null && candidate.nodes != null && candidate.nodes.size() >= 2;
 	}
 
-	/** Active un segment et lance immédiatement le calcul du suivant en arrière-plan. */
+	/** Active un segment après re-validation de ses premiers pas dans le monde live. */
 	private boolean activatePath(PathEngine.PathResult candidate) {
 		if (!usable(candidate)) return false;
+		int lim = Math.min(candidate.nodes.size(), 5);
+		for (int i = 1; i < lim; i++) {
+			BlockPos n = candidate.nodes.get(i);
+			if (model.kind(n.getX(), n.getY(), n.getZ()) == WorldModel.INVALID) return false;
+		}
 		path = candidate;
 		lastPathLen = path.cost;
 		lastSmoothed = path.smoothed;
 		executor = new PathExecutor(mc, cfg, model, path);
 		status = Status.RUNNING;
+		activationFails = 0;
 		if (path.partial) beginLookahead(path.nodes.get(path.nodes.size() - 1));
 		return true;
 	}
@@ -188,8 +230,24 @@ public class Navigator {
 		if (p == null || mc.level == null) { stop(); return; }
 		if (p.isDeadOrDying()) { stop(); msg("§cJoueur mort — navigation arrêtée.§r"); return; }
 
-		// Pause auto (menus, véhicule, lévitation, élytre, sommeil, dégâts si activé) + pause manuelle
-		boolean menuPause = cfg.pauseInMenus && mc.gui.screen() != null && !(mc.gui.screen() instanceof AmberPathScreen);
+		// --- Reprise de main manuelle → arrêt (immédiat au sol, sinon fin du bloc courant) ---
+		if (screenGrace > 0) screenGrace--;
+		if (mc.gui.screen() != null && screenGrace == 0) requestStop("interface ouverte");
+		else if (executor != null ? executor.manualInput() : manualKeys()) requestStop("déplacement manuel");
+		else if (manualLook()) requestStop("caméra déplacée à la main");
+
+		if (pendingStop != null) {
+			if (executor == null || p.onGround() || p.isInWater() || --stopGrace <= 0) {
+				String reason = pendingStop;
+				stop();
+				msg("Navigation §carrêtée§r — " + reason + ".");
+			} else {
+				executor.tick(); // termine le saut / la chute en cours jusqu'au bloc
+			}
+			return;
+		}
+
+		// Pause auto (véhicule, lévitation, élytre, sommeil, dégâts si activé)
 		boolean vehiclePause = p.getVehicle() != null;
 		boolean levPause = p.hasEffect(net.minecraft.world.effect.MobEffects.LEVITATION);
 		boolean elytraPause = p.isFallFlying();
@@ -200,10 +258,10 @@ public class Navigator {
 			if (damageWindow > 0) damageWindow--;
 		}
 		boolean damagePause = cfg.pauseOnDamage && damageWindow > 0 && p.getHealth() < p.getMaxHealth() - 1;
-		if (manualPause || menuPause || vehiclePause || levPause || elytraPause || sleepPause || damagePause) {
+		if (vehiclePause || levPause || elytraPause || sleepPause || damagePause) {
 			if (status != Status.PAUSED) {
 				status = Status.PAUSED;
-				pauseReason = manualPause ? "pause manuelle" : menuPause ? "menu ouvert" : vehiclePause ? "véhicule" : levPause ? "lévitation"
+				pauseReason = vehiclePause ? "véhicule" : levPause ? "lévitation"
 						: elytraPause ? "élytre" : sleepPause ? "sommeil" : "dégâts récents";
 				if (executor != null) executor.release();
 			}
@@ -215,21 +273,29 @@ public class Navigator {
 		if (goalReached()) { arrive(); return; }
 
 		if (status == Status.COMPUTING) {
-			if (engine == null && !beginSearch()) return;
+			if (engine == null && !beginSearch()) { snapshotRot(); return; }
 			engine.tick();
-			if (engine.state == PathEngine.State.SEARCHING) return;
+			if (engine.state == PathEngine.State.SEARCHING) { snapshotRot(); return; }
 			lastExpansions = engine.expansions;
 			lastComputeMs = engine.result() != null ? engine.result().timeMs : 0;
 			PathEngine.PathResult computed = engine.result();
 			engine = null;
 			if (!activatePath(computed)) {
+				if (usable(computed) && activationFails < 3) {
+					// Le monde a changé sous nos pieds : nouvelle recherche immédiate.
+					activationFails++;
+					queuedPath = null;
+					snapshotRot();
+					return;
+				}
+				activationFails = 0;
 				boolean goalLoaded = model.loaded(goal.x, goal.y == null ? Mth_floor(p.getY()) : goal.y, goal.z);
 				if (!goalLoaded && cfg.autoReplan) {
 					status = Status.FAILED; failedAt = now; retryAt = now + 1500;
 					msg("Objectif hors chunks chargés — §enouvelle tentative automatique§r…");
 				} else {
 					status = Status.FAILED; failedAt = now;
-					msg("§cAucun chemin trouvé§r (objectif inaccessible ou hors chunks chargés).");
+					msg("§cAucun chemin trouvé§r (objectif inaccessible ou hors chunks chargés). §7/go <x> [y] <z>§r pour réessayer.");
 					p.playSound(SoundEvents.VILLAGER_NO, 0.6f, 1f);
 				}
 				return;
@@ -258,7 +324,7 @@ public class Navigator {
 					else if (queuedPath != null && usable(queuedPath)) {
 						PathEngine.PathResult next = queuedPath;
 						queuedPath = null;
-						activatePath(next);
+						if (!activatePath(next)) { executor = null; status = Status.COMPUTING; }
 					}
 					else if (engine != null) {
 						// Le segment est terminé avant le calcul anticipé : on attend ce calcul sans immobiliser le moteur.
@@ -279,6 +345,16 @@ public class Navigator {
 					msg("Chute évitée (santé insuffisante) — §erecalcul§r…");
 					engine = null; queuedPath = null; executor = null; beginSearch(); status = Status.COMPUTING;
 				}
+				case JUMP_FAILED -> {
+					// Saut manqué détecté en vol : recalcul immédiat + cible blacklistée
+					// (on ne retentera pas ce saut impossible).
+					if (!cfg.autoReplan || replans >= 256) { status = Status.FAILED; failedAt = now; msg("§cSaut impossible — navigation arrêtée.§r"); executor.release(); return; }
+					replans++;
+					BlockPos t = executor.target();
+					if (t != null) { tempBlocked.put(t.asLong(), now + 20000); if (model != null) model.invalidate(); }
+					msg("Saut manqué — §erecalcul immédiat§r (cible écartée).");
+					engine = null; queuedPath = null; executor = null; beginSearch(); status = Status.COMPUTING;
+				}
 				case STUCK, BLOCKED -> {
 					if (!cfg.autoReplan || replans >= 256) { status = Status.FAILED; failedAt = now; msg("§cBlocage — navigation arrêtée.§r"); executor.release(); return; }
 					replans++;
@@ -293,6 +369,9 @@ public class Navigator {
 				default -> {}
 			}
 		}
+
+		// Référence de caméra fraîche pour toute phase sans exécuteur (détection souris manuelle).
+		if (status == Status.COMPUTING && executor == null) snapshotRot();
 	}
 
 	private void arrive() {
@@ -305,7 +384,7 @@ public class Navigator {
 			p.playSound(SoundEvents.EXPERIENCE_ORB_PICKUP, 0.9f, 1.0f);
 			p.playSound(SoundEvents.AMETHYST_BLOCK_CHIME, 0.8f, 1.2f);
 		}
-		msg("§aArrivé à destination ✓§r  (§e" + goal.x + ", " + (goal.y == null ? "auto" : goal.y) + ", " + goal.z + "§r)");
+		msg("§aArrivé à destination ✓§r  (§e" + goal.x + ", " + (goal.y == null ? "auto" : goal.y) + ", " + goal.z + "§r) — navigation terminée.");
 	}
 
 	public void tickEnd() {
@@ -323,7 +402,7 @@ public class Navigator {
 			if (goal != null) {
 				int gy = goal.y == null ? findColumnTop(goal.x, goal.z) : goal.y;
 				Gizmos.cuboid(new BlockPos(goal.x, gy, goal.z), GizmoStyle.stroke(0xFFE8A85C, 2.0f)).persistForMillis(120).setAlwaysOnTop();
-				Gizmos.point(Vec3.atCenterOf(new BlockPos(goal.x, gy + 1, goal.z)), 0xFFE8A85C, 6f).persistForMillis(120);
+				Gizmos.point(Vec3.atCenterOf(new BlockPos(goal.x, gy + 1, goal.z)), 0xFFE8A85C, 6f).persistForMillis(120).setAlwaysOnTop();
 			}
 		} catch (Throwable ignored) {}
 	}
